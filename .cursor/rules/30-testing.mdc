@@ -1,0 +1,34 @@
+---
+description: Testing conventions. Always loaded.
+alwaysApply: true
+---
+
+# Testing
+
+## Tooling
+- JUnit 5, AssertJ, Mockito (all from `spring-boot-starter-test`).
+- H2 (in-memory) for `@DataJpaTest` and `@SpringBootTest` slices when speed matters.
+- Testcontainers Postgres only if a slice cannot run on H2 (e.g. uses Postgres-specific JSONB or `@SQLRestriction` SQL that differs). Document the choice in the test class JavaDoc.
+
+## Where tests live
+- `src/test/java/com/att/tdp/issueflow/<feature>/<ClassUnderTest>Test.java` — unit tests with Mockito.
+- `src/test/java/com/att/tdp/issueflow/<feature>/<Controller>WebMvcTest.java` — `@WebMvcTest` slice tests, mocking the service.
+- `src/test/java/com/att/tdp/issueflow/<feature>/<Repository>JpaTest.java` — `@DataJpaTest`.
+- `src/test/java/com/att/tdp/issueflow/IssueFlowApplicationTests.java` — boot smoke test (already exists).
+- `src/test/resources/application.yaml` — H2 datasource for tests.
+
+## Naming
+- `@DisplayName` per method describing the behavior, not the method name.
+- Method pattern: `should<Behavior>_when<Condition>()`.
+- Example: `should_return409_whenStatusTransitionIsBackward()`.
+
+## What to cover (per slice — non-negotiable)
+- Every service method with branching logic: one test per branch (happy path, each error path, each FSM transition).
+- Every controller: at least one happy-path `@WebMvcTest` and one error-path test per endpoint.
+- Cross-cutting concerns (locking, FSM, soft delete, RBAC) get dedicated tests, not just incidental coverage.
+
+## Don't
+- Don't test framework code (Spring MVC routing, JPA mechanics).
+- Don't write tests that only assert mocks were called — assert observable behavior (returned value, persisted state, audit row written).
+- Don't share mutable state across tests. Reset via `@BeforeEach` or use `@Transactional` rollback on integration tests.
+- Don't load the full `@SpringBootTest` unless the slice tests are insufficient.

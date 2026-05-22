@@ -1,0 +1,39 @@
+---
+description: Java and Spring style rules. Always loaded.
+alwaysApply: true
+---
+
+# Style
+
+## Java
+- Java 21. Use records for immutable DTOs unless they need validation annotations on setters (then use Lombok `@Value` or a class with final fields).
+- No `null` returns for collections — return empty collections.
+- Prefer `Optional<T>` on repository finders; never return `null` from a service.
+- Use `var` only where the right-hand side makes the type obvious.
+- Use text blocks (`"""..."""`) for multi-line strings (SQL, error messages, CSV samples).
+
+## Spring
+- **Constructor injection only.** Use Lombok `@RequiredArgsConstructor` on services/controllers; mark dependencies `private final`.
+- **Controllers are thin.** They validate input via `@Valid` on DTOs and delegate to services. No business logic, no `EntityManager` use, no repository calls.
+- **Services own transactions.** Annotate write methods with `@Transactional`; read methods with `@Transactional(readOnly = true)`.
+- **No `@Autowired` on fields.** No setter injection.
+- **No `Optional` in controller method signatures** — use `@RequestParam(required = false)` + service-side handling.
+- **DTOs in, DTOs out.** Never expose JPA entities in controller responses.
+- Method security via `@PreAuthorize("hasRole('ADMIN')")` on service methods that require RBAC.
+
+## JPA / Hibernate
+- Every entity extends `BaseEntity` and uses `@Entity`, explicit `@Table(name = "...")`, snake_case column names.
+- Enums stored as `@Enumerated(EnumType.STRING)`.
+- Always set `@Column(nullable = false)` where applicable; rely on Bean Validation only for shape, not for nullability.
+- Optimistic locking: `@Version private Long version;` on `Ticket` and `Comment`.
+- Soft delete: `@SQLDelete(sql = "UPDATE <table> SET deleted_at = NOW() WHERE id = ?")` and `@SQLRestriction("deleted_at IS NULL")` on `Ticket` and `Project`. Provide a dedicated repository method for `withDeleted` queries.
+
+## Naming
+- Packages: lowercase, singular noun (`user`, `ticket`, `audit`).
+- Classes: `PascalCase`. Methods/fields: `camelCase`. Constants: `UPPER_SNAKE_CASE`.
+- DTO names: `Create<Entity>Request`, `Update<Entity>Request`, `<Entity>Response`.
+- Test classes: `<ClassUnderTest>Test` for unit, `<Controller>IT` (or `<Controller>WebMvcTest`) for slice tests.
+
+## Errors
+- Throw the project's domain exceptions from `common.exception.*`. The global handler maps them to the response envelope.
+- Use `Logger` (SLF4J via Lombok `@Slf4j`). Never `System.out.println`.

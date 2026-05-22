@@ -1,0 +1,52 @@
+---
+description: HTTP contract — status codes, error envelope, pagination. Always loaded.
+alwaysApply: true
+---
+
+# API contract
+
+## Endpoint paths
+Mirror `README.md` exactly. Notable deviations from REST norms are intentional (per the spec):
+- Update user: `POST /users/update/{userId}` (not PATCH).
+- Update project/ticket/comment: `PATCH`.
+
+## Status codes
+- `200 OK` — successful GET, successful POST/PATCH/DELETE per the README tables.
+- `201 Created` — only if README explicitly says so (default to 200 to match the table).
+- `400 Bad Request` — Bean Validation failures, malformed body, missing required param.
+- `401 Unauthorized` — missing/invalid JWT.
+- `403 Forbidden` — authenticated but lacking role (e.g. non-ADMIN hitting `/tickets/deleted`).
+- `404 Not Found` — entity not found.
+- `409 Conflict` — optimistic-lock failures, FSM violations (e.g. backward status), DONE-ticket edit attempts, blocker-not-resolved, duplicate unique-constraint hits.
+- `413 Payload Too Large` — attachment > 10 MB (mapped from `MaxUploadSizeExceededException`).
+- `415 Unsupported Media Type` — attachment MIME not in allowlist.
+- `422 Unprocessable Entity` — semantically invalid combos (e.g. dependency between tickets in different projects, self-dependency, dependency cycle).
+
+## Error envelope
+All errors returned by `GlobalExceptionHandler` must have this shape:
+```json
+{
+  "statusCode": 409,
+  "error": "Conflict",
+  "code": "TICKET_DONE_IS_IMMUTABLE",
+  "message": "Ticket 42 is DONE and cannot be modified.",
+  "path": "/tickets/42",
+  "timestamp": "2026-05-21T12:34:56.000Z",
+  "details": [ { "field": "status", "issue": "must be one of TODO|IN_PROGRESS|IN_REVIEW|DONE" } ]
+}
+```
+- `code` is a stable machine-readable token (UPPER_SNAKE_CASE) defined in `common.web.ErrorCode`.
+- `details` is optional; used for Bean Validation errors and to list multiple issues at once.
+
+## Pagination
+Endpoints accepting `page` and `pageSize` (e.g. `/users/{id}/mentions`) return:
+```json
+{ "data": [...], "total": 123, "page": 1, "pageSize": 20 }
+```
+Defaults: `page=1`, `pageSize=20`. Max `pageSize=100`. Use Spring's `Pageable` internally but map to this envelope (never expose Spring's `Page` wire format directly).
+
+## JSON conventions
+- `camelCase` keys in request and response bodies.
+- ISO-8601 strings for timestamps (`createdAt`, `updatedAt`, `dueDate`).
+- Enums as uppercase strings (`"DEVELOPER"`, `"HIGH"`).
+- Money/IDs: stick to `long` / `Long`.

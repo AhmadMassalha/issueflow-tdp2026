@@ -1,0 +1,62 @@
+---
+description: Project context, stack, and package layout. Always loaded.
+alwaysApply: true
+---
+
+# IssueFlow project context
+
+## Stack
+- Java 21, Spring Boot 3.4.2, Spring Data JPA (Hibernate 6), Spring Security, Spring Validation.
+- PostgreSQL 16 via Docker Compose (`compose.yml`).
+- Build: Maven via `./mvnw`. Tests: JUnit 5 + AssertJ + Mockito + Spring Boot Test slices.
+- Lombok for boilerplate (constructors, getters, builders).
+
+## Package layout (`com.att.tdp.issueflow`)
+```
+common/
+  entity/BaseEntity.java                  # id, createdAt, updatedAt
+  exception/                              # NotFoundException, ConflictException, ValidationException, ...
+  web/GlobalExceptionHandler.java
+  web/ApiError.java                       # error envelope DTO
+  web/ErrorCode.java                      # stable UPPER_SNAKE_CASE codes
+  enums/                                  # Role, TicketStatus, Priority, TicketType, AuditAction, Actor
+config/
+  SecurityConfig.java
+  JpaConfig.java                          # @EnableJpaAuditing, @EnableTransactionManagement
+  AsyncConfig.java                        # @EnableScheduling
+  OpenApiConfig.java                      # optional (springdoc)
+security/
+  jwt/JwtService.java
+  jwt/JwtAuthenticationFilter.java
+  jwt/TokenDenyListService.java           # in-memory, behind interface
+  CurrentUserService.java
+user/
+  User.java, UserRepository.java, UserService.java, UserController.java, dto/...
+auth/
+  AuthController.java, dto/LoginRequest.java, dto/LoginResponse.java
+project/
+  Project.java, ProjectRepository.java, ProjectService.java, ProjectController.java, dto/...
+ticket/
+  Ticket.java, TicketRepository.java, TicketService.java, TicketController.java, dto/...
+comment/
+  Comment.java, CommentRepository.java, CommentService.java, CommentController.java, dto/...
+audit/
+  AuditLog.java, AuditLogRepository.java, AuditLogService.java, AuditLogController.java, dto/...
+dependency/
+  TicketDependency.java, TicketDependencyRepository.java, TicketDependencyService.java, TicketDependencyController.java
+attachment/
+  Attachment.java, AttachmentRepository.java, AttachmentService.java, AttachmentController.java
+mention/
+  Mention.java, MentionRepository.java, MentionService.java, MentionController.java
+csv/
+  TicketCsvController.java, TicketCsvService.java
+schedule/
+  EscalationJob.java
+IssueFlowApplication.java
+```
+
+## Module template
+Every feature package exposes: `<Entity>.java`, `<Entity>Repository.java`, `<Feature>Service.java`, `<Feature>Controller.java`, a `dto/` subpackage, and colocated `*Test.java` files under `src/test/java/...`.
+
+## Spec contract
+The single source of truth for endpoints is `README.md`. Mirror its paths and payload shapes exactly, even if they look non-RESTy (e.g. `POST /users/update/:userId`).
