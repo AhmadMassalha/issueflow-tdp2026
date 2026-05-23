@@ -631,6 +631,65 @@ These were necessary to make the spec implementable. Each is reviewed by Ahmad b
 
 ---
 
+## Session 04 — Projects CRUD
+**Goal:** `docs/spec/03-projects.md` §1–§6 (5 endpoints, single entity, unique-per-owner name, soft-delete column declared but unused this slice).
+
+**Decisions surfaced before coding (D1–D4) — user approved my recommendations on all four:**
+
+| # | Decision | Options considered | Choice (rationale) |
+|---|---|---|---|
+| D1 | Source of `ownerId` on `POST /projects` | (a) Trust body, validate exists. (b) Body wins for ADMINs only; devs forced to self-own. (c) Ignore body; always = JWT principal. | **(a)** — the README example explicitly shows `ownerId` in the request body; nothing in the spec restricts cross-user project creation, and we don't have a security argument strong enough to override the literal contract. Server still validates the owner exists. |
+| D2 | RBAC on `/projects` (all 5 endpoints) | (a) Open to any authenticated user. (b) `DELETE` ADMIN-only (defensive — one rogue dev can wipe everything). | **(a)** — spec is silent on per-endpoint roles. Reads need to be open (slice 13 auto-assign joins through projects). Deletes were left open *deliberately* (documented in ADR 0006) so the reviewer sees this was a choice, not an oversight. If a production deployment needs the tightening, that's an additive single-line change in `ProjectService`. |
+| D3 | `PATCH` semantics — partial-update granularity | (a) True PATCH: nullable fields = "unchanged"; empty string clears `description`. (b) Quasi-PUT-as-PATCH: both fields required. (c) Full Jackson `JsonNullable` distinction between absent and explicit-null. | **(a)** — simpler DTO (no `JsonNullable` dependency or wrapper), still gives clients the ability to update either field independently. Trade-off documented inline in the controller JavaDoc: "to clear `description`, send `""` not `null`". Not interesting enough to warrant an ADR; mentioned here so the reviewer sees it was considered. |
+| D4 | `PATCH` with both fields absent / both `null` | (a) 400 `VALIDATION_FAILED` with `details=[{field:"_body", issue:"…"}]`. (b) 200 no-op, return current state. | **(a)** — explicit failures debug faster than silent no-ops; matches the existing `ApiError` convention of carrying field-level issue details. The `_body` field name signals "this is a whole-payload issue, not a single field" — same convention I'll use in slice 5 for ticket dependency cycles. |
+
+**Things I'm doing the "obvious standard way" without a separate decision (each verified against spec or an existing rule):**
+- `Project` extends `BaseEntity`; `ownerId` as a plain `Long`, **not** a `@ManyToOne` to `User`. Keeps reads cheap, matches the flat `{id, name, description, ownerId}` response in the README, and avoids dragging a User join into every project list. Slice 13 (auto-assign) will revisit if a JOIN becomes necessary.
+- `deletedAt` column declared but completely unused this slice — slice 9 wires the `@SQLDelete` + `@SQLRestriction` annotations across all soft-delete-capable entities in one pass per ADR 0002. Until then, `DELETE /projects/{id}` is a hard delete (spec 03 §5 explicitly permits this).
+- Unique-constraint pre-check in the service (`existsByOwnerIdAndName`) → spec-specific `PROJECT_DUPLICATE_NAME`. DB constraint stays as the safety net for the race window (same pattern as `UserService` per slice 2). For PATCH-rename collision, add `existsByOwnerIdAndNameAndIdNot` so renaming to your own current name doesn't false-trigger.
+- `POST /projects` returns **200 OK** (not 201) — matches the README and matches the divergence-from-REST call we already made for `/users` in slice 2 D3. Documented in the controller JavaDoc.
+- Path variable name: `projectId` (consistent with `/users/{userId}` from slice 2).
+- All test names cite the spec section they cover (`§1`, `§2`, etc.) per the testing rule.
+
+**Prompt (verbatim, what's about to drive the implementation):**
+> Build slice 4 (Projects CRUD) per `docs/spec/03-projects.md` §1–§6 and the decisions D1–D4 above. Mirror the slice-2 (Users) module layout: `projects/{domain,repository,api,service}`. Reuse `BaseEntity`, `ErrorCode.PROJECT_*` (already present from slice 1), `NotFoundException`, `ConflictException`, `ValidationException`. Write the three test classes (`ProjectRepositoryJpaTest`, `ProjectServiceTest`, `ProjectControllerWebMvcTest`) so every acceptance criterion in §1–§6 maps to at least one named test. Use `@AutoConfigureMockMvc(addFilters = false)` on the `@WebMvcTest` per the rule from slice 3. Stop before the test run and let me read the diff first.
+
+**What the AI produced (files written / changed):**
+- `docs/decisions/0006-rbac-on-projects.md`: ADR for the open-RBAC-on-projects stance, framed against ADR 0005's contrasting choice and explicitly calling out the open hard-delete as deliberate (not oversight).
+- `projects/domain/Project.java`: entity extending `BaseEntity`, table-level unique constraint `uk_projects_owner_name` on `(owner_id, name)`, `ownerId` as plain `Long` (no `@ManyToOne` — rationale in the JavaDoc), `deletedAt` column declared but unused (slice 9 will wire it).
+- `projects/repository/ProjectRepository.java`: two derived `existsBy…` queries, including the `…AndIdNot` variant that PATCH needs so renaming to the same name doesn't false-trigger the uniqueness check.
+- `projects/api/CreateProjectRequest.java`, `PatchProjectRequest.java`, `ProjectResponse.java`: DTO records. `CreateProjectRequest` validates `@NotBlank name`, `@Size(max=10_000) description`, `@NotNull @Positive ownerId`. `PatchProjectRequest` has both fields nullable (D3); `_body`-level "at least one present" rule (D4) is enforced in the service, not at the bean-validation layer, because Bean Validation can't express cross-field "either of these two" cleanly without a class-level annotation.
+- `projects/service/ProjectService.java`: `@Transactional` boundary; no `@PreAuthorize` per ADR 0006; owner-exists pre-check (404 USER_NOT_FOUND); duplicate pre-check (409 PROJECT_DUPLICATE_NAME); PATCH applies fields only when non-null, runs the rename-collision check only when name actually changes.
+- `projects/api/ProjectController.java`: 5 endpoints, `POST` returns 200 (README + slice-2 D3 consistency), `PATCH` is a real `@PatchMapping`, `projectId` path-variable naming matches the `userId` precedent from slice 2.
+- `src/test/.../projects/ProjectRepositoryJpaTest.java` (5 tests): persists + audit timestamps, rejects dup `(owner, name)` at DB level, allows same name across owners, both `existsBy…` queries.
+- `src/test/.../projects/ProjectServiceTest.java` (14 tests): create happy + missing owner + duplicate; findById present + missing; update name-only / description-only / same-name-skips-check / rename-collision-409 / both-fields-null-400 / empty-string clears description / target-missing-404; delete happy + missing.
+- `src/test/.../projects/ProjectControllerWebMvcTest.java` (15 tests): every acceptance criterion §1–§6 plus the explicit Session-04 D3/D4 cases. Uses `@AutoConfigureMockMvc(addFilters = false)` per the slice-3 rule.
+
+**What I changed manually:** *Nothing* — the AI's first cut compiled and passed all 34 new tests plus the 68 carry-over tests with no edits. This is the first slice where that happened, and the reason is structural: the patterns established in slices 1–3 (pre-emptive duplicate checks, `addFilters = false` discipline, exception-cause-unwrapping in `GlobalExceptionHandler`, `_body`-scoped field issues for cross-field validation) all applied here directly. The Gotchas section in `.cursor/rules/30-testing.mdc` was consulted before writing the `@WebMvcTest` and the right annotations went in on the first pass.
+
+**Suggestions I rejected (this slice):**
+- AI proposed a `@ManyToOne(fetch = LAZY) User owner` association on `Project` "for navigability." **Rejected** — the response shape is flat per the README, no current endpoint needs the owner's other fields, and lazy associations are the #1 source of N+1 surprises later. The plain `Long ownerId` + service-level existence check gives us the FK guarantee without the relationship machinery. If slice 13 (auto-assign) genuinely needs to JOIN, we add the association then with a clear use-case.
+- AI proposed a class-level `@AssertTrue` Bean Validation method on `PatchProjectRequest` to encode "at least one of name|description present." **Rejected** — would have surfaced as a generic `VALIDATION_FAILED` with field name like `requestValid` and an awkward message; doing it in the service gives us full control over the `_body` field name and the message, and keeps DTOs purely structural.
+- AI proposed using `Optional<String>` in `PatchProjectRequest` to disambiguate "field absent" from "field present and null." **Rejected** — Jackson handles `Optional` poorly without extra config (treats absent as `null`-inside-`Optional` not `Optional.empty()` in some configurations), and D3 explicitly chose empty-string-means-clear as the simpler model. Saved a dependency + a class of bugs.
+- AI proposed making `POST /projects` return 201 Created "for REST correctness." **Rejected** per the existing Session-02 D3 pattern: the README locks 200 and we stay consistent across resources.
+- AI proposed adding `/projects/by-owner/{ownerId}` filter endpoint "for the UI." **Rejected** — out of scope for this slice (no spec line), and slice-spanning convenience endpoints encourage scope drift.
+
+**Bugs caught in the agent's first cut and fixed pre-test-run:** *None.* This is unusual enough to flag for the reviewer. The lessons accumulated in slices 1–3 (`.cursor/rules/30-testing.mdc` Gotchas, the duplicate-pre-check pattern, the `ApiError.FieldIssue` shape for cross-field issues) eliminated the categories of mistake that bit me earlier.
+
+**Run results:**
+- `./mvnw test` → **`Tests run: 102, Failures: 0, Errors: 0, Skipped: 0` ✅** (BUILD SUCCESS)
+  - Slice-1/2/3 carry-over: 68 tests, all still green.
+  - Slice-4 new: 34 tests across 3 classes (`ProjectRepositoryJpaTest` 5, `ProjectServiceTest` 14, `ProjectControllerWebMvcTest` 15).
+- Spec 03 §1–§6 coverage map (every criterion → ≥1 named test): see the `@DisplayName` strings in `ProjectControllerWebMvcTest`, each tagged with `Spec 03 §N`.
+
+**Lessons from slice 4:**
+- Investing in the "Gotchas" file across slices 1–3 paid off again: this slice was the first end-to-end clean cut. The rule file effectively became checklist-as-code for the agent (and for me reviewing the agent's output).
+- The `_body`-scoped field issue idiom from `ApiError.FieldIssue` is more reusable than I expected — slice 5 (Tickets) will reuse it for `assigneeId` / `projectId` cross-field rules, slice 7 (Dependencies) for self-reference and cycle reporting.
+- `@PatchMapping` (true PATCH verb) feels right when the resource supports partial update; the slice-2 `POST /users/update/{id}` "PATCH-as-POST" awkwardness was a function of the README's API design, not a default to mirror. Going with `PATCH /projects/{id}` here keeps the verb honest where the spec doesn't constrain it.
+- "Plain `Long` foreign-key fields instead of `@ManyToOne`" is a deliberate stylistic call that needs to be documented because the agent will *always* propose the association by default. Worth thinking about a future ADR if it comes up a second time in slice 5.
+
+---
+
 ## Template for future sessions (copy-paste, don't leave empty)
 ```
 ## Session NN — <slice name>
