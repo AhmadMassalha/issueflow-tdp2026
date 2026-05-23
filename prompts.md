@@ -773,6 +773,74 @@ These were necessary to make the spec implementable. Each is reviewed by Ahmad b
 
 ---
 
+## Session 06 — Comments
+**Goal:** `docs/spec/05-comments.md` §1–§6. Four endpoints nested under tickets, `@Version` for optimistic locking (second feature to use it after Tickets), no soft-delete (explicit hard-delete per spec). RBAC: author OR ADMIN can edit/delete.
+
+**Decisions surfaced before coding (D1–D8) — user approved all my recommendations:**
+
+| # | Decision | Choice (rationale) |
+|---|---|---|
+| D1 | Where does `authorId` come from on `POST`? | **Always derived from JWT principal**, body field (if any) ignored. Never trust client for identity — slice 7 (audit) will rely on this same `currentUser` propagation. Note this differs from Projects' `ownerId` (Session 04 D1, body-supplied) because for comments author IS the requesting user by definition; for projects, the README example shows a body-supplied `ownerId` because creator ≠ owner is a valid use case. |
+| D2 | URL tenancy on PATCH/DELETE/GET-single: `PATCH /tickets/5/comments/42` when comment 42 belongs to ticket 7 | **404 `COMMENT_NOT_FOUND`** — don't leak the cross-ticket existence. Implemented via `findByIdAndTicketId(commentId, ticketId)`; one query handles both "comment missing" and "wrong ticket" with the same 404 envelope. |
+| D3 | RBAC enforcement style for edit/delete-own-or-admin | **Service-side check** that throws `ForbiddenException(COMMENT_FORBIDDEN)` after loading the comment. Controller carries `@PreAuthorize("isAuthenticated()")` only as a decorator. Considered the `@PreAuthorize("hasRole('ADMIN') or @commentService.isAuthor(#id, authentication)")` SpEL form — rejected because it couples Security config to a service method that exists only for this annotation, and the SpEL is harder to unit-test than plain Mockito. |
+| D4 | Missing `version` on PATCH | **400 `VERSION_REQUIRED`** (spec §3, same code we used for Tickets §6). Implemented in the service like Session-05 D3 — DTO field nullable, service throws when null. |
+| D5 | `mentionedUsers` field on `CommentResponse` | **Ship as `[]` now**, populate in slice 10. Spec §1 literally says "including `mentionedUsers` (empty array until slice 10)". Locking the response shape now means slice 10 is a content-only change, no client-breaking field addition. |
+| D6 | List ordering on `GET /tickets/{id}/comments` | **`createdAt DESC` (newest first)** per spec §2. Derived query `findByTicketIdOrderByCreatedAtDesc`. No pagination (consistent with Projects/Tickets returning plain arrays; slice 10 introduces pagination as a dedicated concern for the mentions inbox). |
+| D7 | Cascade behaviour when the parent ticket is deleted | **Out of scope for slice 6.** Slice 9 (soft-delete) decides whether soft-deleting a ticket cascades to comments. We don't have soft-delete plumbing yet; pre-deciding would create dead code. |
+| D8 | New error codes | **None new** — `COMMENT_NOT_FOUND` (404), `COMMENT_FORBIDDEN` (403), `COMMENT_VERSION_CONFLICT` (409) were pre-seeded in `ErrorCode` during slice 1, and the `Comment` arm of `handleOptimisticLock` was pre-seeded during slice 5. Both pieces of slice-1/5 forethought pay off in this slice. |
+
+**Obvious / standard items (not separate decisions, but recording for the reviewer):**
+- `Comment` extends `BaseEntity` (id, createdAt, updatedAt); `@Version Long version`; `ticketId` + `authorId` as plain `Long` FK fields (consistent with Project's `ownerId` and Ticket's `projectId`/`assigneeId` per Session 04 / Session 05 — no `@ManyToOne` associations).
+- **No `deletedAt` column** on `Comment` — spec §5 explicitly says hard delete. Comments are NOT in slice 9's soft-delete scope. This is the first entity in the codebase without a soft-delete slot, and is documented in the entity JavaDoc so future agents don't "add it for consistency."
+- `findByIdAndTicketId(commentId, ticketId)` derived query — used everywhere except list/create. Encodes the tenancy invariant (D2) at the query layer so the service can't accidentally skip the check.
+- `IssueFlowUserPrincipal` injected via `@AuthenticationPrincipal` on the controller — same pattern as `AuthController.me`. The service takes a `currentUser` param so it's pure-Java testable with Mockito (no `SecurityContextHolder` mocking).
+- New test helper `as(IssueFlowUserPrincipal)` — a `RequestPostProcessor` that sets the `SecurityContext` before the request runs, so `@WebMvcTest(addFilters=false)` can still exercise the `@AuthenticationPrincipal` resolver path. First time we need this pattern; logged it to `.cursor/rules/30-testing.mdc` if it recurs.
+- POST returns **200 OK** (consistent with every other create in this codebase — Session 02 D3).
+
+**Prompt (verbatim, what's about to drive the implementation):**
+> Build slice 6 (Comments) per `docs/spec/05-comments.md` §1–§6 and the decisions D1–D8 above. Mirror the slice-5 (Tickets) module layout: `comments/{domain,repository,api,service}`. Reuse `BaseEntity`, the existing `COMMENT_*` codes in `ErrorCode` (pre-seeded in slice 1), the existing `Comment` arm in `GlobalExceptionHandler.handleOptimisticLock` (pre-seeded in slice 5), and the slice-5 two-layer optimistic-locking pattern (service pre-check + handler safety net). Author identity is always the JWT principal — never trusted from the body. PATCH/DELETE use `findByIdAndTicketId` so cross-ticket commentId references return 404 `COMMENT_NOT_FOUND`. `CommentResponse` includes `mentionedUsers: []` (slice-10 forward-compat). Write three test classes covering every §1–§6 acceptance criterion; use the new `as(principal)` request post-processor helper so `@WebMvcTest(addFilters=false)` can still drive the `@AuthenticationPrincipal` resolver.
+
+**What the AI produced (files written / changed):**
+- `comments/domain/Comment.java`: entity extending `BaseEntity`, `@Version Long version`, `ticketId` + `authorId` as plain `Long` FK, `content` as `TEXT`, **no `deletedAt` column** (spec §5 explicit hard delete — first entity in the codebase without a soft-delete slot, JavaDoc explains the omission). Index on `ticket_id` for the dominant list-by-ticket access pattern.
+- `comments/repository/CommentRepository.java`: `findByTicketIdOrderByCreatedAtDesc(Long)` (§2 newest-first) and `findByIdAndTicketId(Long, Long)` (D2 tenancy). Two derived queries, no JPQL needed.
+- `comments/api/CreateCommentRequest.java`: just `content` (D1 — `authorId` deliberately absent from the DTO so the contract matches the server behavior). `@NotBlank @Size(max=5000)`.
+- `comments/api/PatchCommentRequest.java`: `content` (nullable) + `version` (nullable but required-in-service per D4). The "null content + valid version = no-op probe" semantic is documented inline so it doesn't look like a bug.
+- `comments/api/CommentResponse.java`: includes `mentionedUsers: List.of()` (D5 forward-compat for slice 10).
+- `comments/service/CommentService.java`: 8-method service. `currentUser` threaded explicitly so the service stays pure-Java testable (no `SecurityContextHolder` mocking). Three private helpers (`assertTicketExists`, `loadOrThrow`, `assertAuthorOrAdmin`) — each method does one thing the JavaDoc names. `TODO(slice-10)` markers on `create` and `update` where the mention extractor will plug in.
+- `comments/api/CommentController.java`: 4 endpoints. `@RequestMapping("/tickets/{ticketId}/comments")` to keep the path nested. `@AuthenticationPrincipal IssueFlowUserPrincipal` injected and threaded into the service. Class-level `@PreAuthorize("isAuthenticated()")` as a belt-and-suspenders decorator (the global chain already enforces this).
+- `src/test/.../comments/CommentRepositoryJpaTest.java` (8 tests): persistence defaults, `@Version` increment, stale-version save (using the slice-5 hand-built-detached-entity gotcha), §2 newest-first ordering, empty result, all three `findByIdAndTicketId` outcomes (match / wrong ticket / missing).
+- `src/test/.../comments/CommentServiceTest.java` (15 tests): every spec §1–§6 branch — list happy + missing ticket, create author-from-principal + missing ticket, PATCH missing-version + stale + tenancy-404 + author-ok + admin-ok + non-author-forbidden + null-content-noop, DELETE author-ok + admin-ok + non-author-forbidden + missing + cross-ticket-404.
+- `src/test/.../comments/CommentControllerWebMvcTest.java` (14 tests): every spec criterion + `mentionedUsers: []` shape lock + the new `as(principal)` `RequestPostProcessor` helper for seeding the SecurityContext under `addFilters=false`.
+
+**What I changed manually:** *Nothing* — first-pass clean, like slice 4. The decision-tabling-up-front (D1-D8) plus the slice-1 forethought of seeding `COMMENT_*` codes in `ErrorCode` and the slice-5 forethought of seeding the `Comment` arm in `handleOptimisticLock` meant there was zero scaffolding rework. The slice-5 `@DataJpaTest` gotcha on optimistic locking applied directly.
+
+**Suggestions I rejected (this slice):**
+- AI proposed using the `@PreAuthorize("hasRole('ADMIN') or @commentService.isAuthor(#commentId, authentication)")` SpEL form for the author-or-admin RBAC. **Rejected per D3** — couples the security config to a `isAuthor(Long, Authentication)` service method that exists only for this annotation, and is harder to unit-test than a plain `if (!isAdmin && !isAuthor) throw ForbiddenException`. The service-side check ships the same enforcement with simpler tests and no SpEL coupling.
+- AI proposed making `authorId` a `@RequestBody` field on `CreateCommentRequest` with a "trust but verify" comment ("override if principal differs"). **Rejected per D1** — the very first 30 seconds of a code review would ask "why is this even on the wire?" Removing the field is honest, prevents accidental misuse, and doesn't leave bait for a future bug where someone removes the override.
+- AI proposed adding a `GET /tickets/{ticketId}/comments/{commentId}` endpoint for symmetry with the other CRUD resources. **Rejected** — spec §1–§5 lists 4 endpoints (no single-comment GET), and the spec-driven discipline means we don't add scope. If slice 10's mentions UI ever needs to deep-link to a comment, that's the slice that adds the endpoint.
+- AI proposed wiring `MentionExtractor` as an interface with a no-op default impl now so the `create`/`update` calls already have a hook to wire later. **Rejected per the slice-5 / slice-4 "no premature abstraction" rule** — `TODO(slice-10)` comments at the call sites are sufficient, dead code is not.
+- AI proposed paginating `GET /tickets/{ticketId}/comments` "for high-volume tickets." **Rejected** — spec §2 says "returns array," matching projects/tickets which also return plain arrays. Slice 10 introduces pagination as a dedicated concern for the mentions inbox; pre-paginating comments would force every client to learn the page envelope for no spec gain.
+
+**Bugs caught in the agent's first cut and fixed pre-test-run:** *None.* This is the second slice (after slice 4) where the first cut passed every test. The recipe is the same — decision-tabling up front, leaning on the `.cursor/rules/30-testing.mdc` Gotchas (the stale-version + addFilters=false ones both applied verbatim), and the slice-1/slice-5 forward-compat seeds (pre-declared `COMMENT_*` error codes, pre-wired `Comment` arm in the optimistic-locking handler) removing two whole categories of new-file overhead from the slice.
+
+**Run results:**
+- `./mvnw test` → **`Tests run: 182, Failures: 0, Errors: 0, Skipped: 0` ✅** (BUILD SUCCESS).
+  - Slices 1–5 carry-over: 145 tests, all still green.
+  - Slice 6 new: 37 tests across 3 classes — `CommentRepositoryJpaTest` 8, `CommentServiceTest` 15, `CommentControllerWebMvcTest` 14.
+- Spec 05 §1–§6 coverage map: every criterion tagged in `@DisplayName` as `Spec 05 §N`. Cross-cutting concerns covered:
+  - **§3 optimistic locking:** repository test (raw JPA throws), service test (fast-path pre-check), controller test (handler maps to `COMMENT_VERSION_CONFLICT`).
+  - **§6 RBAC:** service tests cover all 4 cells of {author, admin} × {update, delete}; controller tests cover the 403 envelope for PATCH and DELETE.
+  - **D2 tenancy:** repository, service, AND controller all test the wrong-ticket-id → 404 `COMMENT_NOT_FOUND` path. Three layers of coverage because this is the one place a regression would silently leak comment existence across tickets.
+
+**Lessons from slice 6:**
+- The pre-seeded `COMMENT_*` codes from slice 1 and the `Comment` arm in `handleOptimisticLock` from slice 5 saved this slice from touching `ErrorCode` or `GlobalExceptionHandler` at all — pure additive feature module. The forward-compat investment in earlier slices keeps paying off; pre-declaring error codes when you anticipate them is "buy time later for the cost of two minutes now."
+- The new `as(principal)` `RequestPostProcessor` helper for `@WebMvcTest(addFilters=false) + @AuthenticationPrincipal` is going to come up again for slice 7 (audit log will also need the actor in the controller). When it does, promote it to a shared `test/support/` class instead of copy-pasting. For now, one private helper is acceptable.
+- Threading `currentUser` as an explicit param through the service (instead of pulling it from `SecurityContextHolder` inside the service) keeps unit tests trivial — no static-mocking, no per-test setup beyond constructing the principal. This is the same "make dependencies explicit" idiom that makes the JWT `Clock` injectable in slice 3.
+- The `null content = no-op probe` semantic on PATCH is a feature, not a bug. The documentation-as-code in `PatchCommentRequest`'s JavaDoc is what makes it a feature instead of a question for the reviewer.
+- Two slices in a row (4 and 6) have shipped first-pass green. The pattern: decision-table → spec coverage map → write code → run tests. The slices that need rework (1, 2, 3, 5) shared the property of introducing a new framework concept (auditing/JPA, security chain, optimistic-locking-in-tests) that the rule file didn't yet cover. Once the gotcha is logged, the next slice that touches that area lands clean.
+
+---
+
 ## Template for future sessions (copy-paste, don't leave empty)
 ```
 ## Session NN — <slice name>
