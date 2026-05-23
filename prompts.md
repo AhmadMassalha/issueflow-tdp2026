@@ -553,6 +553,84 @@ These were necessary to make the spec implementable. Each is reviewed by Ahmad b
 
 ---
 
+## Session 03 — Auth (JWT)
+
+**Spec:** `docs/spec/02-auth.md` (3 endpoints, 7 acceptance criteria) + ADR 0003 (in-memory deny-list).
+
+**Pre-flight decisions (Ahmad approved all four — replies "a, a, yes, a"):**
+
+| # | Decision | Choice | Why this over the alternatives |
+|---|---|---|---|
+| D1 | How does the first ADMIN user get into the DB once `POST /users` requires auth? | `CommandLineRunner` (`AdminSeeder`) that creates one ADMIN if none exists; gated by `app.seed.admin.enabled` (default `true` for dev). Idempotent. Default creds (`admin`/`admin`) logged at WARN. | (b) putting `POST /users` in `permitAll()` would expose admin creation to the public; (c) "manual SQL setup" kills the assignment demo. The seeder solves the chicken-and-egg cleanly and is trivially disabled in real prod. |
+| D2 | Which `/users` endpoints become ADMIN-only? | `POST /users`, `POST /users/update/{id}`, `DELETE /users/{id}` are ADMIN-only. `GET /users` and `GET /users/{id}` are open to any authenticated user. | Developers need to *see* teammates (to assign tickets, mention them) but only admins should *create/destroy/promote* users. ADR 0005 captures the reasoning so the reviewer doesn't have to guess. |
+| D3 | Refresh tokens? | **Skip.** Single 1h access token; user re-logs in after expiry. | Spec mentions only `accessToken`; no `/auth/refresh` endpoint. Refresh-token flow adds rotation, replay defense, and a second store — out of scope and noted in ADR 0003 update. |
+| D4 | Where does `JWT_SECRET` come from in tests? | `application.yaml: jwt.secret: ${JWT_SECRET:}` (env wins, otherwise empty + fail-fast on startup). `test/resources/application.yaml` overrides with a fixed 256-bit test secret. | (b) hardcoding a default secret in main config is a production landmine. Spring's standard property layering already does the job; tests get a deterministic key for round-trip assertions. |
+
+**"Obvious-standard" implementation calls (no vote needed, all approved implicitly):**
+- Custom `AuthenticationEntryPoint` + `AccessDeniedHandler` that funnel through `HandlerExceptionResolver` so 401/403 responses still use our `ApiError` envelope.
+- `SessionCreationPolicy.STATELESS`, CSRF disabled (JWT API, no browser session).
+- `@PreAuthorize` over `@Secured`; `@EnableMethodSecurity(prePostEnabled = true)`.
+- `IssueFlowUserPrincipal` record implementing `UserDetails`; `getAuthorities()` returns `ROLE_<UPPER>` so `hasRole('ADMIN')` works without configuring a role hierarchy.
+- `@EnableScheduling` in a new `SchedulingConfig` (deny-list prune now; slice 14 reuses for escalation).
+- Bcrypt-equal-time login: even on user-not-found, run `passwordEncoder.matches(rawPassword, sentinelHash)` to mitigate username-enumeration timing attacks (spec 02 §2).
+- `jjwt 0.12.6` with the new `Jwts.builder().subject().claim()...` API and `parseSignedClaims(...)`.
+- `/error` permitAll alongside `/auth/login` (otherwise Spring Boot's default error page mapping breaks).
+
+**Prompt:**
+> Implement Slice 3 (Auth/JWT) per `docs/spec/02-auth.md`. Decisions D1–D4 approved. Pull in `spring-boot-starter-security` (which transitively re-includes the BCrypt module from slice 2) and `io.jsonwebtoken:jjwt-{api,impl,jackson}:0.12.6`. Build `auth/{jwt,security,api,service}` plus `SecurityConfig`, `SchedulingConfig`, `AdminSeeder`. Add `AccessDeniedException` and `AuthenticationException` arms to `GlobalExceptionHandler` (the slice-1 placeholders). Add `@PreAuthorize("hasRole('ADMIN')")` on `UserService.create/update/delete`. Update existing `UserControllerWebMvcTest` so `@WebMvcTest` slices play nice with the now-present filter chain. New tests: `JwtServiceTest`, `InMemoryTokenDenyListTest`, `AuthControllerWebMvcTest`, `SecurityIntegrationTest`. Definition of Done: `./mvnw test` green, every spec 02 §1–§7 criterion traceable to a named test, ADR 0005 written (RBAC scope on `/users`).
+
+**What the AI produced (in implementation order):**
+- `pom.xml`: dropped the explicit `spring-security-crypto` entry, added `spring-boot-starter-security` (transitively re-exports the same BCrypt module) + `spring-security-test` (test scope). Added `io.jsonwebtoken:jjwt-{api,impl,jackson}:0.12.6`.
+- `application.yaml`: `jwt.secret: ${JWT_SECRET:}` (env wins, blank in main → fail-fast), `jwt.expires-in-seconds: 3600`, `jwt.issuer: issueflow`; `app.seed.admin.enabled: true` + default creds (with WARN log on first use).
+- `test/resources/application.yaml`: deterministic 256-bit test secret; `app.seed.admin.enabled: false`.
+- `IssueFlowApplication`: added `@ConfigurationPropertiesScan` so record-style `@ConfigurationProperties` (`JwtProperties`, `AdminSeedProperties`) bind automatically.
+- `config/SchedulingConfig`: `@EnableScheduling` + `Clock` bean (the time source the deny-list and JWT layer share; tests fix this via a stub clock).
+- `config/SecurityConfig`: `@EnableMethodSecurity(prePostEnabled = true)`, stateless filter chain, CSRF disabled, `permitAll()` exactly for `POST /auth/login` + `/error` (spec 02 §3), `JwtAuthenticationFilter` placed before `UsernamePasswordAuthenticationFilter`. Custom `AuthenticationEntryPoint` + `AccessDeniedHandler` that delegate to `handlerExceptionResolver` so the `ApiError` envelope still applies. Filter registered as an explicit `@Bean` here (see "Bugs caught" §1).
+- `common/web/GlobalExceptionHandler`: new arms for `AccessDeniedException` → 403 `AUTH_FORBIDDEN` and `AuthenticationException` → 401 `AUTH_TOKEN_INVALID`; class JavaDoc updated to remove the slice-1 "deferred to slice 3" placeholder.
+- `auth/jwt/JwtProperties`: record-style `@ConfigurationProperties(prefix = "jwt")`.
+- `auth/jwt/JwtService`: HS256 signer/parser using jjwt 0.12 (`Jwts.builder().issuer().subject().claim().id()…`). Constructor fail-fast on blank secret + sub-32-byte secret. Injects `Clock` so expiry branches are testable without sleeping.
+- `auth/jwt/TokenDenyList` interface + `auth/jwt/InMemoryTokenDenyList` impl: `ConcurrentHashMap<String, Instant>` keyed by jti, `@Scheduled(fixedDelayString = "PT10M")` prune job.
+- `auth/security/IssueFlowUserPrincipal`: record implementing `UserDetails`. `getAuthorities()` returns `ROLE_<role>` so `hasRole('ADMIN')` works without a `RoleHierarchy`.
+- `auth/security/IssueFlowUserDetailsService`: `loadUserByUsername` → `IssueFlowUserPrincipal.from(User)` or throws `UsernameNotFoundException`.
+- `auth/security/JwtAuthenticationFilter`: `OncePerRequestFilter` (not `@Component` — see bugs §1). Parses Bearer header; rejects malformed/expired/wrong-sig as 401 `AUTH_TOKEN_INVALID`; rejects deny-listed jti as 401 `AUTH_TOKEN_REVOKED`. Routes failures through `HandlerExceptionResolver` so the global advice maps them to `ApiError` (filter-thrown exceptions bypass `DispatcherServlet` otherwise).
+- `auth/service/AuthService`: `login` runs BCrypt on a sentinel hash even when the username doesn't exist (timing-attack mitigation, spec 02 §2); same response message + code for both unknown-username and wrong-password. `logout` extracts jti via `JwtService.getJti` (tolerant of already-expired tokens) and adds it to the deny-list with the token's stated `exp`.
+- `auth/api/{LoginRequest, LoginResponse, AuthController}`: 3 endpoints per spec. `LoginRequest` validates only `@NotBlank` to preserve identical timing/shape on bad creds. `AuthController.me` uses `@AuthenticationPrincipal IssueFlowUserPrincipal` and re-fetches through `UserService.findById` so the response is the same shape as `GET /users/{id}`.
+- `users/service/UserService`: `@PreAuthorize("hasRole('ADMIN')")` on `create`, `update`, `delete` (D2 / ADR 0005). Reads stay open to any authenticated user.
+- `users/seed/{AdminSeedProperties, AdminSeeder}`: gated `CommandLineRunner` that creates one ADMIN if none exists; bypasses `@PreAuthorize` by writing through `UserRepository` directly (justified in ADR 0005).
+- `docs/decisions/0005-rbac-on-users.md`: new ADR capturing the RBAC scope rationale.
+- `.cursor/rules/30-testing.mdc`: two new Gotchas (`addFilters = false` once security is on the classpath; custom filters should be `@Bean` not `@Component` to avoid `@WebMvcTest` autodiscovery).
+- Test updates to slices 1+2: `UserControllerWebMvcTest` and `GlobalExceptionHandlerTest` both get `@AutoConfigureMockMvc(addFilters = false)` so they aren't blanket-401'd by the now-active default security chain.
+- New tests (25 cases):
+  - `JwtServiceTest` (7): round-trip, expired, wrong sig, wrong issuer, jti-from-expired, fail-fast on blank/short secret.
+  - `InMemoryTokenDenyListTest` (3): add+isRevoked, prune expired, no-op when nothing to prune.
+  - `AuthControllerWebMvcTest` (4): login happy, 401 on InvalidCredentialsException, identical shape for unknown-username (spec 02 §2), 400 on blank username.
+  - `SecurityIntegrationTest` (11, `@SpringBootTest`): no-auth → 401, valid token → 200, garbage token → 401, wrong-password 401, unknown-username same-shape, logout revokes (reuse → 401 AUTH_TOKEN_REVOKED), `/auth/me` happy, DEVELOPER DELETE /users/{id} → 403, ADMIN DELETE → 204 + persisted, DEVELOPER POST /users → 403, ADMIN POST → 200 + persisted.
+
+**Bugs I caught in the agent's first cut (fixed before declaring slice done):**
+1. **`@WebMvcTest` slices failed with `UnsatisfiedDependencyException: No qualifying bean of type 'JwtService'`.** The agent put `@Component` on `JwtAuthenticationFilter`. `@WebMvcTest`'s web slice *includes* `Filter` subclasses (controllers, advice, converters, filters — that's the whole web layer) but *excludes* `@Service`-annotated beans. So the filter got auto-discovered with a dependency on `JwtService` that wasn't loaded, and every existing `@WebMvcTest` (`GlobalExceptionHandlerTest`, `UserControllerWebMvcTest`, the new `AuthControllerWebMvcTest`) blew up with the same context-load failure. **Fix:** remove `@Component` from the filter; register it as an explicit `@Bean` in `SecurityConfig`. Now `@WebMvcTest` doesn't discover it (because it doesn't load `SecurityConfig` either), and `addFilters = false` on the affected tests covers the rest. **Lesson logged** to `.cursor/rules/30-testing.mdc` Gotchas section so future filter additions don't repeat the trap.
+2. **`NumberFormatException | IllegalArgumentException` multi-catch.** Java forbids multi-catch with related types (`NumberFormatException extends IllegalArgumentException`). Compile error caught on first build. **Fix:** caught the superclass only, with a comment noting both real causes (bad `sub` claim, bad `role` claim) are subsumed.
+
+**Suggestions I rejected:**
+- AI proposed making `JwtAuthenticationFilter` extend `AbstractAuthenticationProcessingFilter` (Spring Security's full machinery for "this filter authenticates"). **Rejected** — that abstraction is designed for form-login-style filters that consume credentials from the request; we're consuming credentials from a header that's already been validated by signature. `OncePerRequestFilter` is the closer fit and produces simpler code.
+- AI proposed a `RefreshToken` entity + `POST /auth/refresh` endpoint "for completeness." **Rejected per D3** — spec doesn't ask for it; adding it bloats slice 3 and creates a second store to maintain.
+- AI proposed storing the deny-list in JPA so revocations survive restarts. **Rejected per ADR 0003** — the interface explicitly leaves room for that swap if a real deployment needs it; the in-memory impl is sufficient for the assignment.
+- AI proposed exposing `passwordHash` on `IssueFlowUserPrincipal` as a public field. **Rejected** — it's already `private` via the record component and only `getPassword()` (Spring's UserDetails contract) exposes it. Even that goes nowhere in JWT mode.
+- AI proposed adding a separate `AccessDeniedException` arm that includes the user's authorities in the response body for debugging. **Rejected** — leaks role information to unauthorized callers; the spec'd code + message are sufficient.
+
+**Run results:**
+- `./mvnw test` → **`Tests run: 68, Failures: 0, Errors: 0, Skipped: 0` ✅**
+  - Slice-1/2 carry-over: `IssueFlowApplicationTests` (1), `BaseEntityJpaTest` (2), `GlobalExceptionHandlerTest` (11), `UserServiceTest` (9), `UserRepositoryJpaTest` (5), `UserControllerWebMvcTest` (15)
+  - Slice-3 new: `JwtServiceTest` (7), `InMemoryTokenDenyListTest` (3), `AuthControllerWebMvcTest` (4), `SecurityIntegrationTest` (11)
+- Spec 02 §1–§7 coverage map (each criterion → at least one named test): see `SecurityIntegrationTest` JavaDoc + the per-test `@DisplayName` strings.
+
+**Lessons from slice 3:**
+- "It's a filter so it should be `@Component`" is wrong when `@WebMvcTest` exists in the codebase. The web-slice include rule for filters silently couples authentication wiring to every controller test in the project. Register filters as explicit beans in the config that owns them — the dependency direction matches reality (security config → filter), and the test slice stays decoupled.
+- The same insight applies to *any* component that the web slice would auto-discover but whose dependencies live outside the web slice: prefer `@Bean` in a config over `@Component` when there's a cross-slice dependency.
+- The slice-1/slice-2 hygiene investment (Gotchas section, paired-status-with-code assertions, `addFilters = false`) paid off: when the security chain went live and started returning blanket 401s in `@WebMvcTest`, the rule file already had the right note, and the fix was mechanical instead of investigative.
+- Spec 02 §2's "indistinguishable timing" is more a *contract* than a *test*: I asserted the indistinguishable *shape* (same code, same message) in both unit and integration tests; actual timing parity is enforced structurally by always running BCrypt against the sentinel hash on the user-not-found path. Sub-100ms timing differences are dominated by GC / JIT / scheduler noise and aren't testable in a CI-stable way.
+
+---
+
 ## Template for future sessions (copy-paste, don't leave empty)
 ```
 ## Session NN — <slice name>

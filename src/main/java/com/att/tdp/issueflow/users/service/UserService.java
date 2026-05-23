@@ -9,6 +9,7 @@ import com.att.tdp.issueflow.users.domain.User;
 import com.att.tdp.issueflow.users.repository.UserRepository;
 import java.util.List;
 import lombok.RequiredArgsConstructor;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -47,6 +48,7 @@ public class UserService {
                         ErrorCode.USER_NOT_FOUND, "User " + id + " was not found."));
     }
 
+    @PreAuthorize("hasRole('ADMIN')")
     public User create(CreateUserRequest req) {
         if (users.existsByUsername(req.username())) {
             throw new ConflictException(
@@ -68,6 +70,7 @@ public class UserService {
         return users.save(u);
     }
 
+    @PreAuthorize("hasRole('ADMIN')")
     public User update(Long id, UpdateUserRequest req) {
         User u = findById(id);
         u.setFullName(req.fullName());
@@ -76,6 +79,7 @@ public class UserService {
         return u; // dirty checking persists on commit
     }
 
+    @PreAuthorize("hasRole('ADMIN')")
     public void delete(Long id) {
         if (!users.existsById(id)) {
             throw new NotFoundException(

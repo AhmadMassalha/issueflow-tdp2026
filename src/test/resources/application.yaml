@@ -21,6 +21,24 @@ spring:
       max-file-size: 10MB
       max-request-size: 10MB
 
+# ---- Auth (slice 3) ---------------------------------------------------------
+# Deterministic 256-bit HS256 key for test round-trips. Never used in production.
+jwt:
+  secret: test-secret-test-secret-test-secret-test-secret-32bytes!
+  expires-in-seconds: 3600
+  issuer: issueflow-test
+
+# AdminSeeder is disabled in tests — each test that needs an ADMIN persists one
+# explicitly through the repository or mocks the principal via @WithMockUser.
+app:
+  seed:
+    admin:
+      enabled: false
+      username: admin
+      password: admin
+      email: admin@issueflow.local
+      full-name: Default Admin
+
 logging:
   level:
     org.hibernate.SQL: WARN

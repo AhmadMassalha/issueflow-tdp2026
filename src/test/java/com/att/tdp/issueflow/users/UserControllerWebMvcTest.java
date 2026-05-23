@@ -32,6 +32,7 @@ import java.util.List;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
@@ -47,8 +48,14 @@ import org.springframework.test.web.servlet.MockMvc;
  * <p>The {@code @Import} list mirrors the slice-1 lesson logged in
  * {@code .cursor/rules/30-testing.mdc}: {@link GlobalExceptionHandler} must be
  * imported explicitly so the error envelope mapping is exercised here.
+ *
+ * <p>Filters are disabled ({@code addFilters = false}) so that Spring Security's
+ * default "everything is 401" auto-config does not interfere with controller-
+ * logic assertions. End-to-end security behavior (authn required, ADMIN-only on
+ * mutating endpoints) lives in {@code SecurityIntegrationTest}.
  */
 @WebMvcTest(controllers = UserController.class)
+@AutoConfigureMockMvc(addFilters = false)
 @Import(GlobalExceptionHandler.class)
 class UserControllerWebMvcTest {
 

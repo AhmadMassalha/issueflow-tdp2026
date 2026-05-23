@@ -44,15 +44,38 @@
 		</dependency>
 
 		<!--
-			BCrypt only — full spring-boot-starter-security arrives in slice 3.
-			This module is what spring-security-core uses for password hashing and
-			pulls in zero web/filter-chain code; slice 3's starter transitively
-			includes the same artifact, so this dependency stays valid post-upgrade.
-			Version is managed by the Spring Boot BOM.
+			Slice 3 (Auth): the full security starter brings the filter chain,
+			method-security, and transitively re-exports the BCrypt module that
+			slice 2 used standalone. The explicit spring-security-crypto entry
+			has been removed because it would now be a duplicate.
 		-->
 		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-security</artifactId>
+		</dependency>
+		<dependency>
 			<groupId>org.springframework.security</groupId>
-			<artifactId>spring-security-crypto</artifactId>
+			<artifactId>spring-security-test</artifactId>
+			<scope>test</scope>
+		</dependency>
+
+		<!-- JJWT 0.12.x — pinned per docs/plan.md slice-3 dependency list. -->
+		<dependency>
+			<groupId>io.jsonwebtoken</groupId>
+			<artifactId>jjwt-api</artifactId>
+			<version>0.12.6</version>
+		</dependency>
+		<dependency>
+			<groupId>io.jsonwebtoken</groupId>
+			<artifactId>jjwt-impl</artifactId>
+			<version>0.12.6</version>
+			<scope>runtime</scope>
+		</dependency>
+		<dependency>
+			<groupId>io.jsonwebtoken</groupId>
+			<artifactId>jjwt-jackson</artifactId>
+			<version>0.12.6</version>
+			<scope>runtime</scope>
 		</dependency>
 
 		<dependency>

@@ -13,6 +13,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.core.AuthenticationException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -31,8 +33,12 @@ import org.springframework.web.servlet.resource.NoResourceFoundException;
  *   <li>Catch-all {@link Exception} → 500 {@code INTERNAL_ERROR}; logged at ERROR.</li>
  * </ol>
  *
- * <p>{@code AccessDeniedException} mapping is intentionally omitted here; it will
- * be added in slice 3 once Spring Security is on the classpath.
+ * <p>Slice 3 added Spring Security arms: {@link AccessDeniedException} → 403
+ * {@code AUTH_FORBIDDEN}, {@link AuthenticationException} → 401
+ * {@code AUTH_TOKEN_INVALID}. Both are reached via the custom
+ * {@code AuthenticationEntryPoint}/{@code AccessDeniedHandler} in
+ * {@code SecurityConfig}, which delegates to the {@code HandlerExceptionResolver}
+ * so this advice still runs.
  */
 @RestControllerAdvice
 @Slf4j
@@ -132,6 +138,37 @@ public class GlobalExceptionHandler {
         ApiError body = ApiError.of(HttpStatus.CONFLICT, ErrorCode.DATA_INTEGRITY_VIOLATION,
                 "Database integrity violation.", req.getRequestURI());
         return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
+    }
+
+    // ---- Security ---------------------------------------------------------------
+
+    /**
+     * Authenticated user lacked the required role / authority. Mapped to 403
+     * {@code AUTH_FORBIDDEN} (spec 02 §7).
+     */
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<ApiError> handleAccessDenied(AccessDeniedException ex, HttpServletRequest req) {
+        ApiError body = ApiError.of(HttpStatus.FORBIDDEN, ErrorCode.AUTH_FORBIDDEN,
+                "Access denied: insufficient role for " + req.getMethod() + " " + req.getRequestURI(),
+                req.getRequestURI());
+        return ResponseEntity.status(HttpStatus.FORBIDDEN).body(body);
+    }
+
+    /**
+     * Reached when Spring Security's filter chain rejects a request that
+     * required authentication and didn't have it (e.g. no header on a
+     * protected endpoint). Spec 02 §3/§4 require 401 {@code AUTH_TOKEN_INVALID}.
+     *
+     * <p>Token-specific failures thrown from {@code JwtAuthenticationFilter} are
+     * domain exceptions and handled by {@link #handleDomain}; this arm is only
+     * for Spring's own {@link AuthenticationException} types.
+     */
+    @ExceptionHandler(AuthenticationException.class)
+    public ResponseEntity<ApiError> handleAuthentication(AuthenticationException ex, HttpServletRequest req) {
+        ApiError body = ApiError.of(HttpStatus.UNAUTHORIZED, ErrorCode.AUTH_TOKEN_INVALID,
+                "Authentication is required for " + req.getMethod() + " " + req.getRequestURI(),
+                req.getRequestURI());
+        return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(body);
     }
 
     // ---- Routing ----------------------------------------------------------------

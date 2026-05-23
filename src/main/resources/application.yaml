@@ -26,6 +26,25 @@ spring:
       max-file-size: 10MB
       max-request-size: 10MB
 
+# ---- Application-specific settings (slice 3) --------------------------------
+jwt:
+  # HS256 secret. Env wins. Empty triggers fail-fast on startup (see JwtService).
+  secret: ${JWT_SECRET:}
+  # Token lifetime in seconds (spec 02 §1: 3600 = 1h).
+  expires-in-seconds: 3600
+  issuer: issueflow
+
+app:
+  seed:
+    admin:
+      # If true and no ADMIN exists, create a default admin/admin user at startup.
+      # WARN-logged. Disable in production.
+      enabled: true
+      username: admin
+      password: admin
+      email: admin@issueflow.local
+      full-name: Default Admin
+
 logging:
   level:
     com.att.tdp.issueflow: INFO
