@@ -9,6 +9,8 @@ import java.time.Instant;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
+import org.hibernate.annotations.SQLDelete;
+import org.hibernate.annotations.SQLRestriction;
 
 /**
  * Project — a top-level container that tickets (slice 5) will belong to.
@@ -27,10 +29,23 @@ import lombok.Setter;
  * the safety net for the race (same pattern as {@link
  * com.att.tdp.issueflow.users.domain.User}).
  *
- * <p><b>Soft delete:</b> {@code deletedAt} is declared here but not yet
- * exercised. Slice 9 wires {@code @SQLDelete} + {@code @SQLRestriction} on
- * every soft-delete-capable entity in one pass per ADR 0002. Until then,
- * {@code DELETE /projects/{id}} is a hard delete (spec 03 §5 permits this).
+ * <p><b>Soft delete (slice 9, spec 08 + ADR 0002):</b>
+ * <ul>
+ *   <li>{@link SQLDelete} replaces Hibernate's generated DELETE with an
+ *       UPDATE setting {@code deleted_at = NOW()}. Existing
+ *       {@code repo.deleteById(id)} callers are unchanged.</li>
+ *   <li>{@link SQLRestriction} hides soft-deleted rows from every JPQL/HQL/
+ *       derived-query SELECT. ADMIN-only {@code GET /projects/deleted}
+ *       bypasses via a native query.</li>
+ *   <li>Restore via {@code POST /projects/{id}/restore} — native
+ *       {@code @Modifying} UPDATE because {@code findById} would be filtered
+ *       out. No {@code version} column on this entity (spec 03 doesn't
+ *       require optimistic locking for projects); {@link
+ *       com.att.tdp.issueflow.tickets.domain.Ticket} DOES bump version in
+ *       its restore.</li>
+ *   <li>Per ADR 0002: project soft-delete does NOT cascade to tickets.
+ *       Restoring a project leaves its tickets' state untouched.</li>
+ * </ul>
  */
 @Entity
 @Table(
@@ -39,6 +54,8 @@ import lombok.Setter;
                 @UniqueConstraint(name = "uk_projects_owner_name", columnNames = {"owner_id", "name"})
         }
 )
+@SQLDelete(sql = "UPDATE projects SET deleted_at = NOW() WHERE id = ?")
+@SQLRestriction("deleted_at IS NULL")
 @Getter
 @Setter
 @NoArgsConstructor

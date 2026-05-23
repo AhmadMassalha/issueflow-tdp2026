@@ -314,4 +314,71 @@ class ProjectControllerWebMvcTest {
                 .andExpect(jsonPath("$.code").value("PROJECT_NOT_FOUND"))
                 .andExpect(jsonPath("$.path").value("/projects/99"));
     }
+
+    // ---- Slice 9: /deleted + /restore HTTP shape ---------------------------
+    //
+    // RBAC (403 for DEVELOPER, 200 for ADMIN) is covered in
+    // SoftDeleteIntegrationTest, not here — @WebMvcTest with addFilters=false
+    // bypasses @PreAuthorize entirely (slice-7 Gotcha). These tests just
+    // verify the HTTP contract on the happy/error paths assuming the security
+    // gate already passed.
+
+    @Test
+    @DisplayName("Slice 9: GET /projects/deleted returns array of soft-deleted projects with deletedAt populated")
+    void should_listDeletedProjects() throws Exception {
+        Project p = new Project();
+        p.setId(99L);
+        p.setName("dead");
+        p.setDescription("d");
+        p.setOwnerId(1L);
+        p.setDeletedAt(java.time.Instant.parse("2026-05-24T00:00:00Z"));
+        when(service.findAllDeleted()).thenReturn(List.of(p));
+
+        mvc.perform(get("/projects/deleted"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].id").value(99))
+                .andExpect(jsonPath("$[0].name").value("dead"))
+                .andExpect(jsonPath("$[0].deletedAt").value("2026-05-24T00:00:00Z"));
+    }
+
+    @Test
+    @DisplayName("Slice 9: POST /projects/{id}/restore returns 200 with the restored project")
+    void should_restoreProject() throws Exception {
+        Project p = new Project();
+        p.setId(7L);
+        p.setName("revived");
+        p.setDescription("d");
+        p.setOwnerId(1L);
+        when(service.restore(7L)).thenReturn(p);
+
+        mvc.perform(post("/projects/7/restore"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(7))
+                .andExpect(jsonPath("$.name").value("revived"))
+                .andExpect(jsonPath("$.deletedAt").doesNotExist());
+    }
+
+    @Test
+    @DisplayName("Slice 9: POST /projects/{id}/restore → 404 PROJECT_NOT_FOUND when row never existed")
+    void should_return404_whenRestoreTargetMissing() throws Exception {
+        when(service.restore(99L))
+                .thenThrow(new NotFoundException(
+                        ErrorCode.PROJECT_NOT_FOUND, "Project 99 was not found."));
+
+        mvc.perform(post("/projects/99/restore"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("PROJECT_NOT_FOUND"));
+    }
+
+    @Test
+    @DisplayName("Slice 9: POST /projects/{id}/restore → 409 ALREADY_ACTIVE when project is already active")
+    void should_return409_whenRestoreTargetAlreadyActive() throws Exception {
+        when(service.restore(7L))
+                .thenThrow(new ConflictException(
+                        ErrorCode.ALREADY_ACTIVE, "Project 7 is already active."));
+
+        mvc.perform(post("/projects/7/restore"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("ALREADY_ACTIVE"));
+    }
 }

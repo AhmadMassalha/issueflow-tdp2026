@@ -121,4 +121,75 @@ class ProjectRepositoryJpaTest {
         // beta trying to rename to its own name → not a collision.
         assertThat(projects.existsByOwnerIdAndNameAndIdNot(1L, "beta", beta.getId())).isFalse();
     }
+
+    // ---- Slice 9: @SQLDelete + @SQLRestriction + native bypass --------------
+
+    @Test
+    @DisplayName("Slice 9: deleteById issues SQLDelete UPDATE; standard queries treat row as missing")
+    void should_softDelete_viaSQLDelete() {
+        Project saved = projects.saveAndFlush(newProject("doomed", 1L));
+        Long id = saved.getId();
+
+        projects.deleteById(id);
+        em.flush();
+
+        assertThat(projects.existsByIdIncludingDeleted(id)).isTrue();
+        assertThat(projects.findById(id)).isEmpty();
+        assertThat(projects.existsById(id)).isFalse();
+    }
+
+    @Test
+    @DisplayName("Slice 9: @SQLRestriction excludes deleted rows from findAll AND existsByOwnerIdAndName")
+    void should_excludeDeleted_fromStandardQueries() {
+        Project alive = projects.saveAndFlush(newProject("alive", 1L));
+        Project doomed = projects.saveAndFlush(newProject("doomed", 1L));
+        projects.deleteById(doomed.getId());
+        em.flush();
+        em.clear();
+
+        assertThat(projects.findAll()).extracting(Project::getId).containsExactly(alive.getId());
+        // Important cross-feature: after a project is soft-deleted, an owner
+        // can reuse the freed name on a NEW project — uniqueness derived
+        // query is filtered.
+        assertThat(projects.existsByOwnerIdAndName(1L, "doomed")).isFalse();
+    }
+
+    @Test
+    @DisplayName("Slice 9: findAllDeleted surfaces ONLY soft-deleted rows, sorted by id asc")
+    void should_findAllDeleted_bypassRestriction() {
+        Project alive = projects.saveAndFlush(newProject("alive", 1L));
+        Project deletedA = projects.saveAndFlush(newProject("delA", 1L));
+        Project deletedB = projects.saveAndFlush(newProject("delB", 2L));
+        projects.deleteById(deletedA.getId());
+        projects.deleteById(deletedB.getId());
+        em.flush();
+        em.clear();
+
+        assertThat(projects.findAllDeleted())
+                .extracting(Project::getId)
+                .containsExactly(deletedA.getId(), deletedB.getId())
+                .doesNotContain(alive.getId());
+    }
+
+    @Test
+    @DisplayName("Slice 9: restoreById affects 1 row, sets deleted_at = NULL (Project has no @Version, so no version bump)")
+    void should_restoreById_clearsDeletedAt() {
+        Project alive = projects.saveAndFlush(newProject("alive", 1L));
+        Long aliveId = alive.getId();
+        Project doomed = projects.saveAndFlush(newProject("doomed", 1L));
+        Long doomedId = doomed.getId();
+        projects.deleteById(doomedId);
+        em.flush();
+        em.clear();
+
+        assertThat(projects.restoreById(doomedId)).isEqualTo(1);
+        // Idempotency guard: re-restoring an already-active row is a no-op
+        // because of the WHERE deleted_at IS NOT NULL clause.
+        assertThat(projects.restoreById(aliveId)).isZero();
+        assertThat(projects.restoreById(99_999L)).isZero();
+
+        em.clear();
+        Project restored = projects.findById(doomedId).orElseThrow();
+        assertThat(restored.getDeletedAt()).isNull();
+    }
 }

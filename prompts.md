@@ -991,6 +991,89 @@ Three new Gotchas added — H2 cross-class persistence, `@WebMvcTest` × `@Enabl
 
 ---
 
+## Session 09 — Soft delete + restore (spec 08)
+**Goal:** `docs/spec/08-soft-delete.md` §1–§7. Turn on `@SQLDelete` + `@SQLRestriction` for `Project` + `Ticket`, add 4 ADMIN-only endpoints (`GET /{resource}/deleted` + `POST /{resource}/{id}/restore`), and prove the cross-cutting filter behavior actually works across all existing read paths.
+
+**Decisions surfaced before coding (D1–D15) — user approved all my recommendations:**
+
+| # | Decision | Choice (rationale) |
+|---|---|---|
+| D1 | Which entities get soft-delete? | **Only `Project` + `Ticket`.** Spec is explicit. `User` (spec 01 §5) and `Comment` (spec 05) stay hard-delete. `TicketDependency` has no `deletedAt` slot (slice 8). Don't over-generalize a per-entity decision. |
+| D2 | Bypassing `@SQLRestriction` for `/deleted` listings | **Native SQL via `@Query(nativeQuery = true)`.** `@SQLRestriction` is appended to every Hibernate-generated SELECT (JPQL/HQL/derived queries). The ONLY clean bypass is going native. Alternative tricks (subclass entity, `SQLRestriction("")` override) all have surprise modes. |
+| D3 | Restore implementation: load-set-save vs `@Modifying` native UPDATE? | **Native `@Modifying @Query "UPDATE {table} SET deleted_at = NULL, version = version + 1 WHERE id = :id AND deleted_at IS NOT NULL"`.** Single atomic round-trip. `findById(deletedId)` is filtered by `@SQLRestriction` and returns empty — so load-set-save isn't even possible without a native pre-query. The single UPDATE also makes the 0-rows-affected case a race-safe sentinel. |
+| D4 | 404 vs 409 vs 200 distinction in restore | **Two derived queries before the UPDATE:** `existsByIdIncludingDeleted(id)` (native) and `existsById(id)` (default, filtered). If the first is false → 404. If the second is true → 409 `ALREADY_ACTIVE`. Otherwise → run the UPDATE. Avoids `Optional<Optional<Instant>>` mess and is two O(1) PK lookups. |
+| D5 | Effect on every existing `findById`/`findAll`/`findByProjectId` call | **No code changes anywhere.** `@SQLRestriction` makes them automatically filter deleted rows — which IS the desired behavior. A `GET /tickets/{deletedId}` becomes a 404. Spec §2 lists "places deleted things don't appear" — almost all of them get it for free. Future slices (workload counts, mentions) inherit the right behavior. |
+| D6 | DTO `deletedAt` exposure | **Add nullable `deletedAt` to `TicketResponse` + `ProjectResponse`.** Null for active rows; populated for `/deleted` listings. Admins need "when was this deleted?" to decide on restore. One nullable field per DTO; clients that ignore unknown JSON fields don't notice. |
+| D7 | Cross-feature: soft-deleted ticket as blocker | **Dependency ROW survives; `@SQLRestriction` filters the deleted blocker out of `findBlockerSummariesByTicketId`'s JPQL JOIN AND `countOpenBlockers`'s JOIN.** Net effect: a deleted blocker no longer blocks DONE transitions on its dependents. Restored blocker → block returns. Tested in the integration test. |
+| D8 | Cross-feature: soft-deleted project with active tickets | **Tickets stay active; their `project_id` points at a hidden parent. `GET /tickets?projectId=<deletedProjectId>` — behavior verified during implementation (likely 404 via `TicketService.findByProjectId`'s implicit project-existence check via the filter).** Per ADR 0002 — no cascade. |
+| D9 | `@SQLDelete` SQL: literal `NOW()` vs parameterized | **Literal `NOW()`** as the spec writes. Works on H2 + Postgres without binding. |
+| D10 | RBAC on `/deleted` + `/restore` | **`@PreAuthorize("hasRole('ADMIN')")` at the controller method level.** Spec §5 explicit. RBAC tests live in `SoftDeleteIntegrationTest` (per slice-7 Gotcha: `@WebMvcTest` can't reliably test 403 branches). |
+| D11 | New controllers vs extend existing? | **Extend `TicketController` + `ProjectController`.** `/deleted` is a list view of those resources, `/restore` is an operation on a known resource. Spec lays out endpoints under existing controller URL roots. |
+| D12 | `DELETE` 200 vs 204 (spec §1 says "200 with no body", slices 4/5 already ship 204) | **Keep 204.** REST-standard for "successful, no content". Spec wording is loose; clients already handle 204; breaking the contract for a wording quirk has zero benefit. Documented as an explicit deviation. |
+| D13 | Cross-cutting test strategy | **One dedicated `SoftDeleteIntegrationTest` (`@SpringBootTest`).** Proves every cross-cutting property end-to-end (404 on `GET`/`PATCH` of deleted, missing from list, missing from comment-tenancy, missing from blocker-count). NOT scattered through 30 existing tests — same Session-07 D9 pattern. |
+| D14 | `version` interaction on restore | **Native UPDATE bumps `version` by 1 explicitly.** Going native sidesteps `@Version`'s auto-increment; the bump keeps any optimistic-locking client holding a stale handle honest. Edge case but cheap. |
+| D15 | Audit row on soft-delete: new action or reuse `DELETE`? | **Reuse `AuditAction.DELETE`.** From the client's perspective the API behavior didn't change — still "I deleted thing X". `RESTORE` is the only novel action. Spec §7 wording matches. |
+
+**Obvious / standard items (not separate decisions):**
+- Zero new `ErrorCode` (`ALREADY_ACTIVE` pre-seeded slice 1). Zero new `AuditAction` (`RESTORE` pre-seeded). Zero new `EntityType`. **5th** consecutive slice with no enum churn.
+- `Comment` is hard-delete and stays so. `TicketDependency` is hard-delete and stays so. `User` is hard-delete (spec 01 §5).
+- All existing service `delete(id)` methods stay byte-identical. `@SQLDelete` intercepts the SQL Hibernate generates for `repo.deleteById(id)` / `EntityManager.remove(...)` — no service changes needed beyond the new `restore` methods.
+- Hibernate 6.x note: `@SQLRestriction` (replaces deprecated `@Where`) is appended to entity SELECTs. We use the new name.
+- The native `UPDATE`'s `version = version + 1` clause is important — without it, an optimistic-locking client holding a stale `version` would still write through (since the JPA version check isn't running on a native query).
+
+**Touch list:**
+- Modified main source: `tickets/domain/Ticket.java`, `projects/domain/Project.java`, `tickets/repository/TicketRepository.java`, `projects/repository/ProjectRepository.java`, `tickets/service/TicketService.java`, `projects/service/ProjectService.java`, `tickets/api/TicketController.java`, `projects/api/ProjectController.java`, `tickets/api/TicketResponse.java`, `projects/api/ProjectResponse.java` (10 files).
+- New tests: `SoftDeleteIntegrationTest` (cross-cutting + RBAC + cross-feature dep-blocker proof).
+- Modified tests: `TicketRepositoryJpaTest`, `ProjectRepositoryJpaTest`, `TicketServiceTest`, `ProjectServiceTest`, `TicketControllerWebMvcTest`, `ProjectControllerWebMvcTest` (extend, don't replace).
+
+**Prompt (verbatim):**
+> Build slice 9 (Soft delete + restore) per `docs/spec/08-soft-delete.md` and decisions D1–D15 above. Annotate `Ticket` + `Project` with `@SQLDelete(sql = "UPDATE ... SET deleted_at = NOW() WHERE id = ?")` + `@SQLRestriction("deleted_at IS NULL")`. Add native repository methods: `existsByIdIncludingDeleted`, `findDeletedByProjectId` / `findAllDeleted`, `restoreById` (`@Modifying`, bumps version). Add `restore(id)` + `findDeleted...(...)` service methods writing `AuditAction.RESTORE`. Add `GET /tickets/deleted?projectId=X` + `POST /tickets/{id}/restore` + same for projects, all `@PreAuthorize("hasRole('ADMIN')")`. Add nullable `deletedAt` to `TicketResponse` + `ProjectResponse`. Tests: extend the repo + service + controller tests with the new arms; one new `SoftDeleteIntegrationTest` (`@SpringBootTest`) covers cross-cutting filter behavior, ADMIN-only RBAC, and the cross-feature property that a soft-deleted blocker stops blocking DONE transitions. Watch for: existing tests that hard-delete then read may now hit 404 instead of the original 200 — that's the desired behavior change, expect to adjust assertions.
+
+**AI output (files shipped — minor manual rewrites on two production lines, both caught at test time):**
+
+| File | Notes |
+|---|---|
+| `tickets/domain/Ticket.java` (MODIFIED) | `@SQLDelete(sql = "UPDATE tickets SET deleted_at = NOW() WHERE id = ? AND version = ?")` + `@SQLRestriction("deleted_at IS NULL")`. **Two placeholders**, not one (Bug #1 below). Updated class JavaDoc. |
+| `projects/domain/Project.java` (MODIFIED) | Single-placeholder SQL (`WHERE id = ?`) — Project has no `@Version`. Updated class JavaDoc. |
+| `tickets/repository/TicketRepository.java` (MODIFIED) | +3 native methods: `findDeletedByProjectId`, `existsByIdIncludingDeleted`, `restoreById` (`@Modifying`, bumps version). |
+| `projects/repository/ProjectRepository.java` (MODIFIED) | +3 native methods: `findAllDeleted`, `existsByIdIncludingDeleted`, `restoreById` (NO version bump — Project has no `@Version`; this was Bug #2). |
+| `tickets/service/TicketService.java` (MODIFIED) | +2 methods: `findDeletedByProjectId`, `restore` (404/409/200 logic + audit RESTORE). |
+| `projects/service/ProjectService.java` (MODIFIED) | Same: +2 methods. |
+| `tickets/api/TicketController.java` (MODIFIED) | +2 endpoints: `GET /tickets/deleted?projectId=X` + `POST /tickets/{id}/restore`. `@PreAuthorize("hasRole('ADMIN')")`. |
+| `projects/api/ProjectController.java` (MODIFIED) | Same shape: +2 endpoints. |
+| `tickets/api/TicketResponse.java` + `projects/api/ProjectResponse.java` (MODIFIED) | +1 nullable `deletedAt Instant` field each. |
+| `TicketRepositoryJpaTest` (MODIFIED) | +5 tests: soft-delete via `@SQLDelete`, `@SQLRestriction` exclusion, `findDeletedByProjectId` bypass, `existsByIdIncludingDeleted` across all states, `restoreById` (returns 1 on success / 0 on no-op + version bump). |
+| `ProjectRepositoryJpaTest` (MODIFIED) | +4 tests: same shape minus version bump. Adds the cross-feature proof that "soft-deleted project's name is free for the same owner to reuse" (because `existsByOwnerIdAndName` is filtered). |
+| `TicketServiceTest` (MODIFIED) | +5 tests: restore happy + 404 + 409-already-active + 409-race-window + `findDeletedByProjectId` delegation. |
+| `ProjectServiceTest` (MODIFIED) | +5 tests: same shape. |
+| `TicketControllerWebMvcTest` (MODIFIED) | +5 tests: `/deleted` happy + missing `projectId` 400 + `/restore` 200 + 404 + 409. |
+| `ProjectControllerWebMvcTest` (MODIFIED) | +4 tests: `/deleted` happy + `/restore` 200 + 404 + 409. |
+| `SoftDeleteIntegrationTest` (NEW) | 10 cross-cutting `@SpringBootTest` tests: soft-deleted ticket invisible to GET/PATCH/list, audit DELETE row written, RBAC 403 for DEVELOPER × 4 endpoints, ADMIN can list + restore + audit RESTORE, restore-already-active 409, ADR-0002 no-cascade proof, **cross-feature with slice 8 (soft-deleted blocker no longer blocks DONE)**. |
+
+**Bugs caught during the test pass (2 bugs, both in production code this time — first slice in a while where AI's first generation needed correction):**
+
+1. **Hibernate `@SQLDelete` + `@Version` parameter binding** — the AI's first-pass SQL for `Ticket` was `UPDATE tickets SET deleted_at = NOW() WHERE id = ?` (one placeholder). At test time, every `@SpringBootTest` class blew up on `BeforeEach`'s `tickets.deleteAll()` with H2 error 90008 "Invalid value 2 for parameter parameterIndex". **Root cause:** when an entity has `@Version`, Hibernate's `@SQLDelete` parameter binding appends a `version = ?` parameter (so its generated DELETE always uses optimistic-locking-style `WHERE id = ? AND version = ?`). The custom SQL must therefore include BOTH placeholders, in the order `(id, version)`. **Fix:** SQL changed to `WHERE id = ? AND version = ?` + a JavaDoc comment pointing at the lesson. Lesson promoted to `.cursor/rules/30-testing.mdc`.
+2. **Project `restoreById` referenced a non-existent `version` column** — the AI symmetrically copied the Ticket restore SQL (`SET deleted_at = NULL, version = version + 1`) to ProjectRepository, but `Project` has no `@Version` (spec 03 doesn't require optimistic locking for projects). Caught at compile time when the test couldn't find `project.getVersion()`. **Fix:** Project's `restoreById` SQL just sets `deleted_at = NULL`; JavaDoc explains the asymmetry with Ticket. Test for Project was simplified accordingly.
+
+**Lessons logged to `.cursor/rules/30-testing.mdc`:**
+- *(new gotcha)* "`@SQLDelete` on a `@Version`-bearing entity requires a two-placeholder SQL — Hibernate binds `(id, version)` in that order. A single-`?` SQL fires at test time with H2 error 90008 'Invalid value 2 for parameter parameterIndex'. Symptom: every `@SpringBootTest` class fails on `BeforeEach`'s `deleteAll()` even though `@DataJpaTest` repository tests pass (because `@DataJpaTest` rolls back the txn before commit-time SQL fires)."
+
+**Rejected suggestions (and why):**
+- I rejected an "if soft-delete cascades, add cascading restore" path. ADR 0002 already settles: no cascade either way. Cleanly tested in `SoftDeleteIntegrationTest.projectDelete_doesNotCascadeToTickets`.
+- I rejected changing `DELETE`'s 204 → 200 to literally match spec wording (Session 09 D12). The contract is already shipped + tested with 204; breaking it for wording would invalidate the front-end's existing handling.
+- I rejected adding `deletedAt` to the response DTOs as a separate `*DeletedResponse` record. Nullable field on the existing DTO is one line and avoids DTO proliferation (Session 09 D6).
+- I rejected a recursive CTE in the cross-project ticket list — the @SQLRestriction filter handles "deleted tickets vanish from project queries" automatically; the orphan-by-filter case for soft-deleted projects' tickets has its own admin endpoint.
+
+**Run results:**
+- `./mvnw test`: **308 / 308 green** (+38 from slice 8's 270)
+- New tests: `SoftDeleteIntegrationTest` (10) + repo additions (TicketRepo +5, ProjectRepo +4) + service additions (TicketSvc +5, ProjectSvc +5) + controller additions (TicketCtrl +5, ProjectCtrl +4). Total: 43 new tests; +38 net counting the slice's removed/replaced ones.
+- **Zero new `ErrorCode` / `AuditAction` / `EntityType` additions** (`ALREADY_ACTIVE`, `RESTORE`, `PROJECT`/`TICKET` all pre-seeded slice 1/7). **5th** consecutive slice with no enum churn.
+- Zero existing tests required modification (other than the additions). The `@SQLRestriction` is so thorough that "ticket gets soft-deleted in a test" wasn't a pattern any existing test relied on — every existing test that deletes either deletes-then-doesn't-read (clean) OR creates a fresh entity per test (clean).
+
+**Slice 9 closed.** Next: slice 10 (mentions).
+
+---
+
 ## Template for future sessions (copy-paste, don't leave empty)
 ```
 ## Session NN — <slice name>

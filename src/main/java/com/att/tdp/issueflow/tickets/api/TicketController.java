@@ -5,6 +5,7 @@ import jakarta.validation.Valid;
 import java.util.List;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
@@ -80,5 +81,29 @@ public class TicketController {
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void delete(@PathVariable Long ticketId) {
         service.delete(ticketId);
+    }
+
+    // ---- slice 9: soft-delete listing + restore (ADMIN-only) --------------
+
+    /**
+     * ADMIN-only listing of soft-deleted tickets for a project
+     * ({@code GET /tickets/deleted?projectId=...}, spec 08 §4 + §5).
+     */
+    @GetMapping("/deleted")
+    @PreAuthorize("hasRole('ADMIN')")
+    public List<TicketResponse> listDeleted(@RequestParam Long projectId) {
+        return service.findDeletedByProjectId(projectId).stream()
+                .map(TicketResponse::from).toList();
+    }
+
+    /**
+     * ADMIN-only restore (spec 08 §6). 200 with restored ticket; 404
+     * {@code TICKET_NOT_FOUND} when id never existed; 409
+     * {@code ALREADY_ACTIVE} when ticket is already active.
+     */
+    @PostMapping("/{ticketId}/restore")
+    @PreAuthorize("hasRole('ADMIN')")
+    public TicketResponse restore(@PathVariable Long ticketId) {
+        return TicketResponse.from(service.restore(ticketId));
     }
 }

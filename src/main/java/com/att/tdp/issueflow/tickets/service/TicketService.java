@@ -206,8 +206,59 @@ public class TicketService {
             throw new NotFoundException(
                     ErrorCode.TICKET_NOT_FOUND, "Ticket " + id + " was not found.");
         }
-        tickets.deleteById(id); // slice 9 converts to soft delete via @SQLDelete
+        // Slice 9: @SQLDelete on Ticket makes deleteById issue an UPDATE that
+        // sets deleted_at = NOW() instead of a hard DELETE. The audit semantic
+        // (AuditAction.DELETE) is unchanged from the client's perspective.
+        tickets.deleteById(id);
         auditLog.log(AuditAction.DELETE, EntityType.TICKET, id);
+    }
+
+    // ---- slice 9: soft-delete listing + restore -----------------------------
+
+    /**
+     * ADMIN-only listing of soft-deleted tickets for a project (spec 08
+     * endpoint {@code GET /tickets/deleted?projectId=...}). Bypasses
+     * {@code @SQLRestriction} via a native query (Session 09 D2).
+     * Authorization is enforced at the controller layer.
+     *
+     * <p>Per ADR 0002 — a soft-deleted project's tickets are still active
+     * (no cascade), so this endpoint only surfaces tickets that were
+     * individually deleted. The deleted-project case is served by
+     * {@code GET /projects/deleted}.
+     */
+    @Transactional(readOnly = true)
+    public List<Ticket> findDeletedByProjectId(Long projectId) {
+        return tickets.findDeletedByProjectId(projectId);
+    }
+
+    /**
+     * ADMIN-only restore of a soft-deleted ticket (spec 08 §6 + Session 09
+     * D3/D4). Three terminal states identical to {@code ProjectService.restore}:
+     * 404 (truly missing), 409 (already active), 200 (restored). The native
+     * UPDATE bumps {@code version} explicitly (D14) so stale-handle clients
+     * don't silently overwrite the post-restore state.
+     */
+    public Ticket restore(Long id) {
+        if (!tickets.existsByIdIncludingDeleted(id)) {
+            throw new NotFoundException(
+                    ErrorCode.TICKET_NOT_FOUND, "Ticket " + id + " was not found.");
+        }
+        if (tickets.existsById(id)) {
+            throw new ConflictException(
+                    ErrorCode.ALREADY_ACTIVE,
+                    "Ticket " + id + " is already active; nothing to restore.");
+        }
+        int affected = tickets.restoreById(id);
+        if (affected == 0) {
+            throw new ConflictException(
+                    ErrorCode.ALREADY_ACTIVE,
+                    "Ticket " + id + " was concurrently restored; refresh and try again.");
+        }
+        auditLog.log(AuditAction.RESTORE, EntityType.TICKET, id);
+        return tickets.findById(id)
+                .orElseThrow(() -> new NotFoundException(
+                        ErrorCode.TICKET_NOT_FOUND,
+                        "Ticket " + id + " vanished after restore — investigate."));
     }
 
     // ---- helpers ------------------------------------------------------------

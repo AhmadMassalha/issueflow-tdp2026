@@ -391,4 +391,80 @@ class TicketControllerWebMvcTest {
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("TICKET_NOT_FOUND"));
     }
+
+    // ---- Slice 9: /deleted + /restore HTTP shape ---------------------------
+
+    @Test
+    @DisplayName("Slice 9: GET /tickets/deleted?projectId=X returns array of soft-deleted tickets")
+    void should_listDeletedTickets() throws Exception {
+        Ticket d = new Ticket();
+        d.setId(7L);
+        d.setTitle("dead");
+        d.setDescription("d");
+        d.setStatus(TicketStatus.TODO);
+        d.setPriority(Priority.MEDIUM);
+        d.setType(TicketType.FEATURE);
+        d.setProjectId(1L);
+        d.setVersion(2L);
+        d.setDeletedAt(Instant.parse("2026-05-24T00:00:00Z"));
+        when(service.findDeletedByProjectId(1L)).thenReturn(List.of(d));
+
+        mvc.perform(get("/tickets/deleted").param("projectId", "1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].id").value(7))
+                .andExpect(jsonPath("$[0].deletedAt").value("2026-05-24T00:00:00Z"));
+    }
+
+    @Test
+    @DisplayName("Slice 9: GET /tickets/deleted without projectId → 400 MISSING_PARAMETER")
+    void should_return400_whenDeletedListMissingProjectId() throws Exception {
+        mvc.perform(get("/tickets/deleted"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("MISSING_PARAMETER"));
+    }
+
+    @Test
+    @DisplayName("Slice 9: POST /tickets/{id}/restore returns 200 with the restored ticket (deletedAt absent)")
+    void should_restoreTicket() throws Exception {
+        Ticket restored = new Ticket();
+        restored.setId(7L);
+        restored.setTitle("alive again");
+        restored.setDescription("d");
+        restored.setStatus(TicketStatus.TODO);
+        restored.setPriority(Priority.MEDIUM);
+        restored.setType(TicketType.FEATURE);
+        restored.setProjectId(1L);
+        restored.setVersion(3L);
+        when(service.restore(7L)).thenReturn(restored);
+
+        mvc.perform(post("/tickets/7/restore"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(7))
+                .andExpect(jsonPath("$.title").value("alive again"))
+                .andExpect(jsonPath("$.deletedAt").doesNotExist());
+    }
+
+    @Test
+    @DisplayName("Slice 9: POST /tickets/{id}/restore → 404 TICKET_NOT_FOUND when never existed")
+    void should_return404_whenRestoreTargetMissing() throws Exception {
+        when(service.restore(99L))
+                .thenThrow(new NotFoundException(
+                        ErrorCode.TICKET_NOT_FOUND, "Ticket 99 was not found."));
+
+        mvc.perform(post("/tickets/99/restore"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("TICKET_NOT_FOUND"));
+    }
+
+    @Test
+    @DisplayName("Slice 9: POST /tickets/{id}/restore → 409 ALREADY_ACTIVE when ticket is already active")
+    void should_return409_whenRestoreTargetAlreadyActive() throws Exception {
+        when(service.restore(7L))
+                .thenThrow(new ConflictException(
+                        ErrorCode.ALREADY_ACTIVE, "Ticket 7 is already active."));
+
+        mvc.perform(post("/tickets/7/restore"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("ALREADY_ACTIVE"));
+    }
 }

@@ -448,4 +448,78 @@ class TicketServiceTest {
 
         verify(tickets, never()).deleteById(any());
     }
+
+    // ---- Slice 9: restore --------------------------------------------------
+
+    @Test
+    @DisplayName("restore — happy path: native UPDATE returns 1, audit RESTORE written, returns refreshed ticket")
+    void should_restoreSoftDeletedTicket() {
+        Ticket reloaded = existing(7L, TicketStatus.TODO, Priority.MEDIUM, 1L);
+        when(tickets.existsByIdIncludingDeleted(7L)).thenReturn(true);
+        when(tickets.existsById(7L)).thenReturn(false); // filtered = soft-deleted
+        when(tickets.restoreById(7L)).thenReturn(1);
+        when(tickets.findById(7L)).thenReturn(Optional.of(reloaded));
+
+        Ticket restored = service.restore(7L);
+
+        assertThat(restored.getId()).isEqualTo(7L);
+        verify(tickets).restoreById(7L);
+        verify(auditLog).log(
+                com.att.tdp.issueflow.common.enums.AuditAction.RESTORE,
+                com.att.tdp.issueflow.common.enums.EntityType.TICKET, 7L);
+    }
+
+    @Test
+    @DisplayName("restore — 404 TICKET_NOT_FOUND when row was never created")
+    void should_throw404_whenRestoreTargetNeverExisted() {
+        when(tickets.existsByIdIncludingDeleted(7L)).thenReturn(false);
+
+        assertThatThrownBy(() -> service.restore(7L))
+                .isInstanceOf(NotFoundException.class)
+                .extracting("code")
+                .isEqualTo(ErrorCode.TICKET_NOT_FOUND);
+
+        verify(tickets, never()).restoreById(any());
+        verify(auditLog, never()).log(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("restore — 409 ALREADY_ACTIVE when row is already active")
+    void should_throw409_whenRestoreTargetAlreadyActive() {
+        when(tickets.existsByIdIncludingDeleted(7L)).thenReturn(true);
+        when(tickets.existsById(7L)).thenReturn(true);
+
+        assertThatThrownBy(() -> service.restore(7L))
+                .isInstanceOf(ConflictException.class)
+                .extracting("code")
+                .isEqualTo(ErrorCode.ALREADY_ACTIVE);
+
+        verify(tickets, never()).restoreById(any());
+        verify(auditLog, never()).log(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("restore — 409 ALREADY_ACTIVE when native UPDATE affects 0 rows (race window)")
+    void should_throw409_onRestoreRaceWindow() {
+        when(tickets.existsByIdIncludingDeleted(7L)).thenReturn(true);
+        when(tickets.existsById(7L)).thenReturn(false);
+        when(tickets.restoreById(7L)).thenReturn(0);
+
+        assertThatThrownBy(() -> service.restore(7L))
+                .isInstanceOf(ConflictException.class)
+                .extracting("code")
+                .isEqualTo(ErrorCode.ALREADY_ACTIVE);
+
+        verify(auditLog, never()).log(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("findDeletedByProjectId — delegates to repository's native query (D2 bypass)")
+    void should_delegateFindDeletedByProjectId() {
+        Ticket d = existing(1L, TicketStatus.TODO, Priority.MEDIUM, 1L);
+        when(tickets.findDeletedByProjectId(100L)).thenReturn(java.util.List.of(d));
+
+        assertThat(service.findDeletedByProjectId(100L)).containsExactly(d);
+        verify(tickets).findDeletedByProjectId(100L);
+    }
 }

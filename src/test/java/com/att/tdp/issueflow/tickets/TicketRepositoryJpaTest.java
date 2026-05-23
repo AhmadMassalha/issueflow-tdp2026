@@ -130,4 +130,104 @@ class TicketRepositoryJpaTest {
         assertThat(p2).extracting(Ticket::getTitle).containsExactly("c");
         assertThat(p3).isEmpty();
     }
+
+    // ---- Slice 9: @SQLDelete + @SQLRestriction + native bypass --------------
+
+    @Test
+    @DisplayName("Slice 9: deleteById issues SQLDelete UPDATE (deleted_at = NOW()), not a DELETE")
+    void should_softDelete_viaSQLDelete() {
+        Ticket saved = tickets.saveAndFlush(newTicket("doomed", 1L));
+        Long id = saved.getId();
+
+        tickets.deleteById(id);
+        em.flush();
+
+        // Row is NOT physically gone — native query still sees it.
+        assertThat(tickets.existsByIdIncludingDeleted(id)).isTrue();
+        // ... but the standard derived/JPQL query treats it as missing
+        // because @SQLRestriction filters deleted_at IS NULL.
+        assertThat(tickets.findById(id)).isEmpty();
+        assertThat(tickets.existsById(id)).isFalse();
+    }
+
+    @Test
+    @DisplayName("Slice 9: @SQLRestriction excludes deleted rows from findAll AND findByProjectId")
+    void should_excludeDeleted_fromStandardQueries() {
+        Ticket alive = tickets.saveAndFlush(newTicket("alive", 1L));
+        Ticket doomed = tickets.saveAndFlush(newTicket("doomed", 1L));
+        tickets.deleteById(doomed.getId());
+        em.flush();
+        em.clear();
+
+        assertThat(tickets.findAll()).extracting(Ticket::getId).containsExactly(alive.getId());
+        assertThat(tickets.findByProjectId(1L))
+                .extracting(Ticket::getId).containsExactly(alive.getId());
+    }
+
+    @Test
+    @DisplayName("Slice 9: findDeletedByProjectId surfaces ONLY soft-deleted rows for that project")
+    void should_findDeletedByProjectId_bypassRestriction() {
+        Ticket aliveP1 = tickets.saveAndFlush(newTicket("alive-1", 1L));
+        Ticket deletedP1 = tickets.saveAndFlush(newTicket("deleted-1", 1L));
+        Ticket deletedP2 = tickets.saveAndFlush(newTicket("deleted-2", 2L));
+        tickets.deleteById(deletedP1.getId());
+        tickets.deleteById(deletedP2.getId());
+        em.flush();
+        em.clear();
+
+        // Project 1: only the deleted one comes back.
+        assertThat(tickets.findDeletedByProjectId(1L))
+                .extracting(Ticket::getId).containsExactly(deletedP1.getId());
+        // Project 1: alive ticket is NOT in the deleted list (sanity check).
+        assertThat(tickets.findDeletedByProjectId(1L))
+                .extracting(Ticket::getId).doesNotContain(aliveP1.getId());
+        // Project 2: scoping works.
+        assertThat(tickets.findDeletedByProjectId(2L))
+                .extracting(Ticket::getId).containsExactly(deletedP2.getId());
+    }
+
+    @Test
+    @DisplayName("Slice 9: existsByIdIncludingDeleted returns true for deleted, true for active, false for never-existed")
+    void should_existIncludingDeleted_acrossAllStates() {
+        Ticket alive = tickets.saveAndFlush(newTicket("alive", 1L));
+        Ticket deleted = tickets.saveAndFlush(newTicket("deleted", 1L));
+        tickets.deleteById(deleted.getId());
+        em.flush();
+
+        assertThat(tickets.existsByIdIncludingDeleted(alive.getId())).isTrue();
+        assertThat(tickets.existsByIdIncludingDeleted(deleted.getId())).isTrue();
+        assertThat(tickets.existsByIdIncludingDeleted(99_999L)).isFalse();
+    }
+
+    @Test
+    @DisplayName("Slice 9: restoreById returns 1 on success, 0 when row was already active (idempotency guard)")
+    void should_restoreById_andBumpVersion() {
+        Ticket alive = tickets.saveAndFlush(newTicket("alive", 1L));
+        Long aliveId = alive.getId();
+        Long initialVersion = alive.getVersion();
+        Ticket deleted = tickets.saveAndFlush(newTicket("deleted", 1L));
+        Long deletedId = deleted.getId();
+        Long deletedVersionBefore = deleted.getVersion();
+        tickets.deleteById(deletedId);
+        em.flush();
+        em.clear();
+
+        // Restoring a deleted row returns 1 (one row affected).
+        assertThat(tickets.restoreById(deletedId)).isEqualTo(1);
+        // Restoring an already-active row returns 0 (the WHERE clause's
+        // deleted_at IS NOT NULL guard filters it out — race-window safety).
+        assertThat(tickets.restoreById(aliveId)).isZero();
+        // Restoring a never-existed id returns 0.
+        assertThat(tickets.restoreById(99_999L)).isZero();
+
+        // Post-restore: row is visible via standard findById; version bumped.
+        em.clear();
+        Ticket restored = tickets.findById(deletedId).orElseThrow();
+        assertThat(restored.getDeletedAt()).isNull();
+        assertThat(restored.getVersion()).isEqualTo(deletedVersionBefore + 1);
+        // Alive row's version is unchanged (the zero-affected restoreById
+        // didn't modify it).
+        Ticket aliveReloaded = tickets.findById(aliveId).orElseThrow();
+        assertThat(aliveReloaded.getVersion()).isEqualTo(initialVersion);
+    }
 }

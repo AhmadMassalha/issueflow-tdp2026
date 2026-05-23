@@ -111,11 +111,75 @@ public class ProjectService {
     }
 
     public void delete(Long id) {
+        // existsById is filtered by @SQLRestriction (slice 9) — a 404 here means
+        // the project is either truly missing OR already soft-deleted. Both
+        // cases should return 404 from a client's perspective: a re-DELETE of a
+        // deleted resource is not a meaningful no-op. The audit row is only
+        // written if Hibernate actually issues the SQLDelete UPDATE (which it
+        // does iff the row was reachable via the filtered findById path).
         if (!projects.existsById(id)) {
             throw new NotFoundException(
                     ErrorCode.PROJECT_NOT_FOUND, "Project " + id + " was not found.");
         }
+        // With slice-9's @SQLDelete on Project, this becomes UPDATE … SET
+        // deleted_at = NOW() instead of a hard DELETE. Callers + the audit
+        // semantics (AuditAction.DELETE) are unchanged.
         projects.deleteById(id);
         auditLog.log(AuditAction.DELETE, EntityType.PROJECT, id);
+    }
+
+    // ---- slice 9: soft-delete listing + restore ----------------------------
+
+    /**
+     * ADMIN-only listing of soft-deleted projects (spec 08, endpoint
+     * {@code GET /projects/deleted}). Bypasses {@code @SQLRestriction} via a
+     * native query (Session 09 D2). Authorization is enforced at the
+     * controller layer.
+     */
+    @Transactional(readOnly = true)
+    public List<Project> findAllDeleted() {
+        return projects.findAllDeleted();
+    }
+
+    /**
+     * ADMIN-only restore of a soft-deleted project (spec 08 §6 + Session 09
+     * D3/D4). Three terminal states:
+     * <ul>
+     *   <li>row doesn't physically exist → 404 {@code PROJECT_NOT_FOUND}.</li>
+     *   <li>row is already active → 409 {@code ALREADY_ACTIVE} (re-restore
+     *       is not a no-op; it could mask an audit hole).</li>
+     *   <li>row is soft-deleted → run the native UPDATE, audit RESTORE,
+     *       return the now-active project.</li>
+     * </ul>
+     * Per ADR 0002 — restoring a project does NOT touch any of its tickets.
+     */
+    public Project restore(Long id) {
+        if (!projects.existsByIdIncludingDeleted(id)) {
+            throw new NotFoundException(
+                    ErrorCode.PROJECT_NOT_FOUND, "Project " + id + " was not found.");
+        }
+        if (projects.existsById(id)) {
+            // existsById is filtered → true means the row is active.
+            throw new ConflictException(
+                    ErrorCode.ALREADY_ACTIVE,
+                    "Project " + id + " is already active; nothing to restore.");
+        }
+        int affected = projects.restoreById(id);
+        if (affected == 0) {
+            // Race window: between our two reads above and the UPDATE,
+            // someone else restored or re-deleted this row. The simplest
+            // user-facing answer is to retry; 409 ALREADY_ACTIVE is closest
+            // ("someone got there first").
+            throw new ConflictException(
+                    ErrorCode.ALREADY_ACTIVE,
+                    "Project " + id + " was concurrently restored; refresh and try again.");
+        }
+        auditLog.log(AuditAction.RESTORE, EntityType.PROJECT, id);
+        // Re-fetch via the standard (filtered) findById — succeeds now that
+        // the row is active.
+        return projects.findById(id)
+                .orElseThrow(() -> new NotFoundException(
+                        ErrorCode.PROJECT_NOT_FOUND,
+                        "Project " + id + " vanished after restore — investigate."));
     }
 }

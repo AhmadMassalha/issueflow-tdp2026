@@ -18,6 +18,13 @@ import java.time.Instant;
  * <p>Foreign keys are kept as ids — no expanded {@code project} or
  * {@code assignee} object — consistent with the entity-design choice
  * documented in {@link Ticket}.
+ *
+ * <p><b>Slice 9 — {@code deletedAt}:</b> nullable. {@code null} for every
+ * active ticket (the {@code @SQLRestriction} hides deleted rows from all
+ * standard read paths, so 99% of responses serialize this field as
+ * {@code null}). Populated only when the admin-only {@code GET
+ * /tickets/deleted?projectId=...} surfaces a soft-deleted ticket. Session
+ * 09 D6.
  */
 public record TicketResponse(
         Long id,
@@ -32,7 +39,8 @@ public record TicketResponse(
         boolean isOverdue,
         Long version,
         Instant createdAt,
-        Instant updatedAt
+        Instant updatedAt,
+        Instant deletedAt
 ) {
 
     public static TicketResponse from(Ticket t) {
@@ -49,7 +57,8 @@ public record TicketResponse(
                 t.isOverdue(),
                 t.getVersion(),
                 t.getCreatedAt(),
-                t.getUpdatedAt()
+                t.getUpdatedAt(),
+                t.getDeletedAt()
         );
     }
 }

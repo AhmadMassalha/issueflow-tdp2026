@@ -14,6 +14,8 @@ import java.time.Instant;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
+import org.hibernate.annotations.SQLDelete;
+import org.hibernate.annotations.SQLRestriction;
 
 /**
  * Ticket — the central work item.
@@ -39,15 +41,41 @@ import lombok.Setter;
  *       and emits the same {@code TICKET_VERSION_CONFLICT} code.</li>
  * </ol>
  *
- * <p><b>{@code isOverdue} / {@code deletedAt}:</b> declared here but not
- * actively mutated by this slice. Slice 9 enables {@code deletedAt} via
- * {@code @SQLDelete} + {@code @SQLRestriction}; slice 14 (escalation) toggles
- * {@code isOverdue} from the scheduler. Manual priority changes via PATCH
- * reset {@code isOverdue} to {@code false} per spec 04 §10, implemented in
- * {@code TicketService.update}.
+ * <p><b>{@code isOverdue}:</b> declared here but not actively mutated by
+ * this slice. Slice 14 (escalation) toggles it from the scheduler. Manual
+ * priority changes via PATCH reset {@code isOverdue} to {@code false} per
+ * spec 04 §10, implemented in {@code TicketService.update}.
+ *
+ * <p><b>Soft delete (slice 9, spec 08 + ADR 0002):</b>
+ * <ul>
+ *   <li>{@link SQLDelete} replaces Hibernate's generated {@code DELETE FROM
+ *       tickets WHERE id=?} with an UPDATE that sets {@code deleted_at = NOW()}.
+ *       The application's {@code repo.delete(ticket)} / {@code repo.deleteById(id)}
+ *       calls continue to work unchanged — Hibernate intercepts at SQL
+ *       generation time.</li>
+ *   <li>{@link SQLRestriction} appends {@code AND deleted_at IS NULL} to
+ *       every JPQL/HQL/derived-query SELECT against this entity. Net effect:
+ *       once a row is soft-deleted, every existing read path (GET, PATCH,
+ *       LIST, JOINs from comments + dependencies) treats it as if it doesn't
+ *       exist. This is the desired behavior; the ADMIN-only {@code GET
+ *       /tickets/deleted} bypasses via a {@code nativeQuery=true} repo
+ *       method. See Session 09 D2/D5.</li>
+ *   <li>The restore path ({@code POST /tickets/{id}/restore}) is also native
+ *       ({@code @Modifying} UPDATE) because {@code findById(deletedId)} would
+ *       be filtered out by the restriction. Session 09 D3.</li>
+ *   <li>Per ADR 0002 — soft-delete does NOT cascade from project to ticket.
+ *       Tickets keep their {@code project_id} pointing at the (hidden)
+ *       parent.</li>
+ * </ul>
  */
 @Entity
 @Table(name = "tickets")
+// Two-placeholder SQL: Hibernate binds (id, version) in that order because of
+// @Version. A single-? SQL throws H2 error 90008 "Invalid value 2 for parameter
+// parameterIndex" at delete time. See .cursor/rules/30-testing.mdc Gotcha:
+// "@SQLDelete + @Version requires both placeholders in the custom SQL."
+@SQLDelete(sql = "UPDATE tickets SET deleted_at = NOW() WHERE id = ? AND version = ?")
+@SQLRestriction("deleted_at IS NULL")
 @Getter
 @Setter
 @NoArgsConstructor

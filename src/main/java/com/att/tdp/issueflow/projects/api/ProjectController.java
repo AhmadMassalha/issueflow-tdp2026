@@ -5,6 +5,7 @@ import jakarta.validation.Valid;
 import java.util.List;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
@@ -77,5 +78,29 @@ public class ProjectController {
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void delete(@PathVariable Long projectId) {
         service.delete(projectId);
+    }
+
+    // ---- slice 9: soft-delete listing + restore (ADMIN-only) --------------
+
+    /**
+     * ADMIN-only listing of soft-deleted projects (spec 08 §4 + §5). 204 No
+     * Content vs 204-with-empty-array vs 200-with-empty-array — we return 200
+     * with an empty array for consistency with {@link #list()}.
+     */
+    @GetMapping("/deleted")
+    @PreAuthorize("hasRole('ADMIN')")
+    public List<ProjectResponse> listDeleted() {
+        return service.findAllDeleted().stream().map(ProjectResponse::from).toList();
+    }
+
+    /**
+     * ADMIN-only restore (spec 08 §6). 200 with the restored project on
+     * success; 404 {@code PROJECT_NOT_FOUND} when the id was never used;
+     * 409 {@code ALREADY_ACTIVE} when the project is already active.
+     */
+    @PostMapping("/{projectId}/restore")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ProjectResponse restore(@PathVariable Long projectId) {
+        return ProjectResponse.from(service.restore(projectId));
     }
 }
