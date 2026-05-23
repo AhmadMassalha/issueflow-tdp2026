@@ -32,3 +32,7 @@ alwaysApply: true
 - Don't write tests that only assert mocks were called — assert observable behavior (returned value, persisted state, audit row written).
 - Don't share mutable state across tests. Reset via `@BeforeEach` or use `@Transactional` rollback on integration tests.
 - Don't load the full `@SpringBootTest` unless the slice tests are insufficient.
+
+## Gotchas (learned the hard way)
+- **`@WebMvcTest(controllers = X.class)` only *filters* which controllers to load from the main-app component scan — it does NOT register a controller class declared *inside the test file*.** If you write a dummy controller as an inner class for testing (e.g. to exercise `GlobalExceptionHandler` arms), you MUST also list it in `@Import(...)`, alongside any `@RestControllerAdvice` you want active. Symptom when missed: every request returns 500 because Spring routes to `ResourceHttpRequestHandler` and the catch-all maps `NoResourceFoundException` → 500. Always sanity-check with `andDo(print())` (look at `Handler` and `Resolved Exception`) when a `@WebMvcTest` returns an unexpected status.
+- When asserting status codes in handler tests, **always pair the status assertion with a `$.code` assertion** so a coincidental 500 from a different code path doesn't accidentally satisfy a 500-expected test.

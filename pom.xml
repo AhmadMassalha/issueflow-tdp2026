@@ -43,6 +43,18 @@
 			<artifactId>spring-boot-starter-validation</artifactId>
 		</dependency>
 
+		<!--
+			BCrypt only — full spring-boot-starter-security arrives in slice 3.
+			This module is what spring-security-core uses for password hashing and
+			pulls in zero web/filter-chain code; slice 3's starter transitively
+			includes the same artifact, so this dependency stays valid post-upgrade.
+			Version is managed by the Spring Boot BOM.
+		-->
+		<dependency>
+			<groupId>org.springframework.security</groupId>
+			<artifactId>spring-security-crypto</artifactId>
+		</dependency>
+
 		<dependency>
 			<groupId>org.postgresql</groupId>
 			<artifactId>postgresql</artifactId>

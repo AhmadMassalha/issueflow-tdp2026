@@ -8,17 +8,24 @@ spring:
     url: jdbc:postgresql://localhost:5432/issueflow
     username: issueflow
     password: issueflow
-    driverClassName: org.postgresql.Driver
-    platform: postgres
+    driver-class-name: org.postgresql.Driver
   jpa:
-    database: POSTGRESQL
-    show-sql: true
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    show-sql: false
+    open-in-view: false
     hibernate:
       ddl-auto: update
+    properties:
+      hibernate.jdbc.time_zone: UTC
   sql:
     init:
-      mode: always
+      mode: never
   servlet:
     multipart:
+      enabled: true
       max-file-size: 10MB
       max-request-size: 10MB
+
+logging:
+  level:
+    com.att.tdp.issueflow: INFO

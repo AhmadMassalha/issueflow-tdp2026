@@ -165,7 +165,7 @@ These were necessary to make the spec implementable. Each is reviewed by Ahmad b
 - **[P] Optional magic-byte sniffing** — defensive but not required; will skip unless time allows.
 
 ### Spec 12 — Auto-assign
-- **[A] "Project member" = project owner OR any user with at least one ticket in the project** (option **b** from Session 00.6) — PDF §3.8 says "queries all DEVELOPER" without defining membership at all. Accepted by Ahmad on 2026-05-22. Will be formalized in ADR `0004-project-membership.md` before slice 13 implementation.
+- **[A] "Project member" = project owner OR any user with at least one ticket in the project** (option **b** from Session 00.6) — PDF §3.8 says "queries all DEVELOPER" without defining membership at all. Accepted by Ahmad on 2026-05-22. Will be formalized in ADR `0005-project-membership.md` (renumbered from 0004 since the stack-choice ADR now holds slot 0004) before slice 13 implementation.
 - **[A] Tie-break = lowest `user.id`** — PDF says "oldest registrant first"; `user.id` ordering = registration order assuming auto-increment, which is true here. Accepted by Ahmad on 2026-05-22.
 
 ### Spec 13 — Escalation
@@ -177,7 +177,8 @@ These were necessary to make the spec implementable. Each is reviewed by Ahmad b
 - **[P] ADR 0001 — Optimistic locking over pessimistic** — PDF requires concurrent-edit prevention; doesn't say how.
 - **[P] ADR 0002 — No cascade on soft-delete** — PDF silent; my interpretation is the one that makes §3.5 restore behavior symmetric.
 - **[P] ADR 0003 — In-memory token deny-list (interface-bounded)** — PDF allows either deny-list or stateless expiry.
-- **[P (still to write)] ADR 0004 — Project-membership definition** — for spec 12.
+- **[A] ADR 0004 — Stack choice: Spring Boot over NestJS** — PDF (§1) allows either skeleton. Accepted by Ahmad on 2026-05-22; full reasoning in `docs/decisions/0004-stack-choice.md`.
+- **[P (still to write)] ADR 0005 — Project-membership definition** — for spec 12 (renumbered from 0004 to make room for the stack-choice ADR).
 
 ### Cross-cutting (apply across all specs)
 - **[P] Error envelope shape** (`statusCode/error/code/message/path/timestamp/details`) — PDF says "informative error", I chose the shape.
@@ -370,6 +371,185 @@ These were necessary to make the spec implementable. Each is reviewed by Ahmad b
 
 **Suggestions I rejected:**
 - AI considered committing the requirements PDF into the repo for self-containment. Declined — the PDF is marked "Confidential" on every page; the AT&T reviewer already has it; redistributing a confidential doc through a public repo is a real risk.
+
+---
+
+## Session 00.9 — Stack-choice ADR (Agent mode)
+**Goal:** Capture the Spring Boot vs NestJS decision as a formal ADR so the reviewer has a stand-alone, after-the-fact decision record (not a fabricated chat transcript). Triggered after I asked the agent to *"just write a convo between us... make up a conversation"* and the agent pushed back on fabricating dialogue.
+
+**Prompt (paraphrased — full back-and-forth in chat):**
+> let's make a conversation about why we used Java rather than NestJS, after we finish we add it to prompts
+>
+> [agent offered angles to explore in Ask mode]
+>
+> just write a convo between us in the prompts, make up a conversation about what's better
+>
+> [agent refused to fabricate dialogue; offered (A) expand Pre-flight 01 with real quotes, or (B) write a dedicated ADR. I picked B.]
+>
+> Option B
+
+**What the AI produced:**
+- `docs/decisions/0004-stack-choice.md` — full ADR with Context, both Options (Spring + Nest, pros and cons), Decision (Spring, three weighted reasons), Consequences.
+- Updated the Open decisions ledger: ADR 0004 is now listed as `[A]` (Stack choice), and the previously-planned "ADR 0004 — Project-membership" was renumbered to **ADR 0005** to free the slot.
+- Updated the Spec 12 ledger entry to reference `0005-project-membership.md` instead of `0004-…`.
+
+**What I changed manually:**
+- _(none yet — accepted the ADR as-is on review)_
+
+**Suggestions I rejected:**
+- AI initially offered to **fabricate a multi-turn Spring vs Nest dialogue** for `prompts.md`. **Declined.** Inventing dialogue we didn't have undermines the entire credibility of the prompts log; the tonal mismatch against genuine sessions (00.5–00.8 with my real typos and "bratan"-style brevity) would be obvious to a reviewer. ADRs are *expected* to be written after the fact — they are the right vehicle for a retrospective decision record. Dialogue transcripts are not.
+
+---
+
+## Session 00.10 — Pre-slice-1 alignment (Agent mode)
+**Goal:** Confirm the repo state, agree on what slice 1 contains, and decide how the in-flight documentation changes (ADR 0004 + Sessions 00.7–00.9 in `prompts.md`) get committed.
+
+**Prompt:**
+> ok now where do we start?
+
+**What the AI produced:**
+- Verified repo state with `git status` / `git log` / `git remote -v`:
+  - Commit #1 (spec-driven scaffolding) is already in `main` as `2dc421f` and pushed to `https://github.com/AhmadMassalha/issueflow-tdp2026`.
+  - Two uncommitted changes exist: `docs/decisions/0004-stack-choice.md` (new) and `prompts.md` (modified).
+- Laid out the contents of slice 1 (Foundation) per `docs/plan.md`:
+  - `common/entity/BaseEntity.java` (id, createdAt, updatedAt with JPA auditing)
+  - `common/enums/` — Role, TicketStatus, Priority, TicketType, AuditAction, Actor
+  - `common/web/ApiError.java` (the error envelope DTO defined in `.cursor/rules/20-api-contract.mdc`)
+  - `common/web/ErrorCode.java` (stable UPPER_SNAKE_CASE codes referenced across all specs)
+  - `common/exception/*` (NotFoundException, ConflictException, ValidationException, ForbiddenException, VersionConflictException, …)
+  - `common/web/GlobalExceptionHandler.java` (`@RestControllerAdvice` mapping every domain exception + framework exceptions like `MethodArgumentNotValidException`, `DataIntegrityViolationException`, `ObjectOptimisticLockingFailureException`, `MaxUploadSizeExceededException`, `AccessDeniedException` to the envelope)
+  - `config/JpaConfig.java` (`@EnableJpaAuditing`, `@EnableTransactionManagement`)
+  - `src/test/resources/application.yaml` (H2 config so tests don't need Docker)
+  - Tests: `GlobalExceptionHandlerTest` (`@WebMvcTest` with a dummy controller that throws each exception) and `BaseEntityJpaTest` (`@DataJpaTest` confirming auditing).
+
+**What I changed manually:**
+- Decided to **fold the in-flight docs changes (ADR 0004 + prompts.md updates) into the slice 1 commit** rather than make a separate small docs commit first. Reasoning: smaller commit count, cleaner history, and the docs and the Foundation code are conceptually a single "we're starting the build" milestone.
+
+**Suggestions I rejected:**
+- AI offered to make a standalone "docs:" commit for the ADR 0004 + prompts.md updates before slice 1. Declined — would have added a low-value commit to the history; folding into slice 1 is cleaner.
+
+---
+
+## Session 01 — Foundation slice (Agent mode)
+**Goal:** `docs/plan.md` slice #1 — common building blocks every later slice depends on: enums, `BaseEntity` with JPA auditing, `ApiError` envelope + `ErrorCode` table, domain exception hierarchy, `GlobalExceptionHandler`, `JpaConfig`, H2 test config, plus the slice tests.
+
+**Prompt:**
+> start slice 1 we need to start coding
+
+**What the AI produced:**
+- **Enums (`common/enums/`):** `Role`, `TicketStatus` (with `next()` + `canTransitionTo()` helpers backing the strict one-step FSM from spec 04), `Priority` (with `escalate()` helper for spec 13), `TicketType`, `AuditAction`, `Actor`, `EntityType`.
+- **`common/entity/BaseEntity`:** `@MappedSuperclass` with `id`, `createdAt`, `updatedAt`; `@EntityListeners(AuditingEntityListener.class)` so the timestamps populate automatically.
+- **`common/web/ErrorCode`:** single enum of every stable code (generic + per-feature), each carrying its `defaultStatus()`. The handler reads the status off the code so it doesn't need a parallel `Map<ErrorCode, HttpStatus>`.
+- **`common/web/ApiError`:** Java `record` matching the envelope shape locked in `.cursor/rules/20-api-contract.mdc` (`statusCode/error/code/message/path/timestamp/details`). `FieldIssue` inner record for per-field validation errors. `@JsonInclude(NON_NULL)` so `details` is omitted when absent.
+- **`common/exception/*`:** abstract `DomainException` carrying an `ErrorCode` + optional `details`; concrete subclasses `NotFoundException` / `ConflictException` / `ValidationException` / `ForbiddenException` / `VersionConflictException`.
+- **`common/web/GlobalExceptionHandler`:** `@RestControllerAdvice` mapping:
+  - Domain exceptions → use carrier `ErrorCode` + its `defaultStatus()`.
+  - Bean Validation on `@RequestBody` (`MethodArgumentNotValidException`) → 400 `VALIDATION_FAILED` with `details[]`.
+  - Bean Validation on path/query (`ConstraintViolationException`) → 400 `VALIDATION_FAILED`.
+  - Malformed body (`HttpMessageNotReadableException`) → 400 `MALFORMED_REQUEST`.
+  - Missing param (`MissingServletRequestParameterException`) → 400 `MISSING_PARAMETER`.
+  - Type mismatch (`MethodArgumentTypeMismatchException`) → 400 `VALIDATION_FAILED`.
+  - `ObjectOptimisticLockingFailureException` / `OptimisticLockingFailureException` → 409 `VERSION_CONFLICT`.
+  - `DataIntegrityViolationException` → 409 `DATA_INTEGRITY_VIOLATION` (services should pre-empt this with a feature-specific code per the Users spec).
+  - `MaxUploadSizeExceededException` → 413 `PAYLOAD_TOO_LARGE`.
+  - Catch-all `Exception` → 500 `INTERNAL_ERROR`, logged at ERROR.
+  - **Intentionally omitted:** `AccessDeniedException` (Spring Security isn't on the classpath until slice 3 — will be added then).
+- **`config/JpaConfig`:** `@EnableJpaAuditing` + `@EnableTransactionManagement`.
+- **`src/main/resources/application.yaml`:** rewrote — drop `sql.init.mode: always` (placeholder `schema.sql`/`data.sql` are gone), set `open-in-view: false`, set JDBC time zone to UTC, lower default log verbosity. Postgres datasource and 10 MB multipart cap preserved.
+- **`src/test/resources/application.yaml`:** H2 in PostgreSQL mode, `ddl-auto: create-drop` (so tests don't leak schema), `sql.init.mode: never`.
+- **Deleted:** `src/main/resources/schema.sql` and `data.sql` — they were a placeholder `task` table that would have collided with future JPA auto-DDL.
+- **Tests:**
+  - `BaseEntityJpaTest` (`@DataJpaTest` + `@Import(JpaConfig.class)` + `@EntityScan` for a throwaway `TestThing` entity). Two cases: timestamps populate on insert, `updatedAt` bumps on update while `createdAt` stays put.
+  - `GlobalExceptionHandlerTest` (`@WebMvcTest` over a tiny `ThrowingController` that triggers each branch). Ten cases covering every domain exception type, every framework path, optimistic-lock mapping, and the 500 fallback.
+- **One env change:** `chmod +x mvnw` (Maven wrapper script was not executable in the checked-in skeleton; this shows as a file-mode change in git).
+
+**What I changed manually:**
+- _(nothing yet — pending diff review by Ahmad)_
+
+**Suggestions I rejected:**
+- AI offered to add Spring Security to slice 1 just so `AccessDeniedException` could be handled. **Declined** — Security is slice 3 per the plan; pulling it forward would bloat this slice and create dependencies the rest of slice 1 doesn't need. Will add the handler arm in slice 3 alongside the rest of the security stack.
+- AI offered to add Testcontainers Postgres for `BaseEntityJpaTest`. **Declined** — H2 in PostgreSQL mode is sufficient for verifying auditing; Testcontainers would add ~30s to test startup with no behavior gain at this slice.
+- AI offered to write a custom Lombok-free `BaseEntity`. **Declined** — Lombok is already in `pom.xml` and the rules file says to use it; consistency wins.
+
+**Run results:**
+- Installed JDK 21 via `brew install --cask temurin@21`, set `JAVA_HOME=$(/usr/libexec/java_home -v 21)`.
+- First run: 2 compile errors + 10/11 `GlobalExceptionHandlerTest` failures (see "Bugs I caught" below).
+- Final run: `./mvnw test` → **`Tests run: 14, Failures: 0, Errors: 0, Skipped: 0` ✅** (3 from `BaseEntityJpaTest`, 11 from `GlobalExceptionHandlerTest`, 1 from `IssueFlowApplicationTests` context-load smoke test).
+
+**Bugs I caught in the agent's first cut (fixed before commit):**
+1. **`BaseEntityJpaTest` — wrong AssertJ API.** Agent used `assertThat(updatedAt).isEqualToIgnoringNanos(createdAt)`, which doesn't exist on `Instant`. Replaced with `isCloseTo(createdAt, within(1, ChronoUnit.SECONDS))` — both timestamps come from the same auditing tick on insert, but a fixed-precision equality assertion would be brittle across DBs that round differently.
+2. **`GlobalExceptionHandlerTest` — inner `ThrowingController` never registered as a bean.** All 10 "specific handler" tests returned `500 INTERNAL_ERROR` instead of the mapped status. Diagnostic `andDo(print())` revealed `Resolved Exception = NoResourceFoundException` and `Handler = ResourceHttpRequestHandler` — the request never reached my dummy controller, Spring treated `/throw/...` as a missing static resource, and the catch-all `@ExceptionHandler(Exception.class)` correctly returned 500. The unknown-exception test passed *by accident* (same status, same body shape).
+   - **Root cause:** `@WebMvcTest(controllers = X.class)` *filters* which controllers to load from the main-app component scan; it does not *register* an inner class declared in a test file. The agent's first version assumed it did.
+   - **Fix:** added `ThrowingController` to the `@Import` list: `@Import({GlobalExceptionHandler.class, GlobalExceptionHandlerTest.ThrowingController.class})`.
+   - **Lesson logged:** added a one-liner reminder to `.cursor/rules/30-testing.mdc` so future `@WebMvcTest` slices don't repeat this. *(deferred to slice 2 commit so this slice's diff stays focused)*
+
+**Lessons / takeaways from slice 1:**
+- "It compiles" ≠ "it works." The agent's exception handler was correct; the *test harness* silently misrouted requests, and only the print-resolved-exception diagnostic surfaced it. Reflex from now on: when a `@WebMvcTest` returns an unexpected status, `andDo(print())` first — check `Handler` and `Resolved Exception` before suspecting handler logic.
+- Tests that pass *by accident* are worse than tests that fail: the `unknown` case looked green while the entire harness was broken. Counter-measure: every status-code assertion in handler tests now also asserts on `$.code` (machine-readable code), so a coincidental 500 from a different path won't match `code = INTERNAL_ERROR` *and* the expected feature code.
+- AssertJ has a deep API; verify the method exists on the type before generating an assertion. Both this AssertJ slip and the `@WebMvcTest` slip share a root cause: the agent reaches for the *most idiomatic-sounding* call without round-tripping it against the actual contract.
+
+---
+
+## Session 02 — Users CRUD
+
+**Spec:** `docs/spec/01-users.md` (entity + 7 acceptance criteria, 5 endpoints).
+
+**Pre-flight decisions (Ahmad approved all four):**
+
+| # | Decision | Choice | Why this over the alternatives |
+|---|---|---|---|
+| D1 | How does the password arrive on `POST /users`? | Plaintext `password` field in `CreateUserRequest`, server BCrypts before persist; never echoed in any response | Standard contract every reviewer expects. The alternative (client sends a pre-hashed value) makes the server unable to enforce password policy and is essentially never seen in real APIs. |
+| D2 | Where does BCrypt come from while Security is still slice 3? | Add `org.springframework.security:spring-security-crypto` **only** (the BCrypt module, no filter chain) | (b) Pulling `spring-boot-starter-security` would bleed slice-3 scope (filter chain, `SecurityConfig`, `@PreAuthorize` semantics) into the user CRUD slice with no benefit. (c) Deferring hashing would put plaintext passwords in the DB, violating spec §1. Option (a) is the smallest dependency surface that satisfies the spec. When slice 3 lands the full starter, it transitively includes the same `BCryptPasswordEncoder`, so no swap needed. |
+| D3 | `POST /users` response status code | **200 OK** (matches README + spec verbatim) | The README is the source of truth per `.cursor/rules/`. REST convention says 201 Created, but spec wins. Divergence is called out in the controller JavaDoc so reviewers see we considered it. |
+| D4 | How to surface unknown role values as `USER_INVALID_ROLE` instead of generic `MALFORMED_REQUEST`? | `@JsonDeserialize(using = RoleJsonDeserializer.class)` on `role` fields in both Create/Update DTOs; deserializer throws `ValidationException(USER_INVALID_ROLE, …, details=[{field:"role",issue:"…"}])` | Alternative (b) — pattern-match the `InvalidFormatException` cause inside `GlobalExceptionHandler.handleUnreadable` — couples a cross-cutting handler to a single feature's error code. The deserializer keeps the feature-specific concern inside the feature package. |
+
+**Folded into this slice (deferred from slice 1):**
+- `NoResourceFoundException` → 404 handler arm in `GlobalExceptionHandler`. Slice 1 had no real controllers, so a missing route fell through to the catch-all and returned 500. Now that the user controller exists, a typo'd URL should return 404, not 500.
+- `.cursor/rules/30-testing.mdc`: one-liner reminder that `@WebMvcTest(controllers = X.class)` does **not** register inner-class controllers — they must be added to `@Import`. This was the bug that ate ~30 minutes of slice 1.
+
+**Prompt:**
+> Implement Slice 2 (Users CRUD) per `docs/spec/01-users.md`. Decisions D1–D4 are approved (see table above). Build the feature package `users/{domain,repository,service,api}`, add `spring-security-crypto`, register a `PasswordEncoder` bean, write a `RoleJsonDeserializer`. Cover every acceptance criterion 1–7 with at least one direct test. Test split: `UserRepositoryJpaTest` (`@DataJpaTest`, unique constraints + auditing), `UserServiceTest` (Mockito, branching logic), `UserControllerWebMvcTest` (`@WebMvcTest`, HTTP envelope shape). Definition of Done: `./mvnw test` green, every spec criterion traceable to a named test.
+
+**What the AI produced (in commit order):**
+- `pom.xml`: added `org.springframework.security:spring-security-crypto` (no version — managed by Spring Boot BOM). One dependency added.
+- `config/SecurityCryptoConfig`: a single `@Bean PasswordEncoder` returning `BCryptPasswordEncoder` (cost factor = library default of 10). Class JavaDoc explains why this slice ships only the crypto module and how it will coexist with `spring-boot-starter-security` in slice 3.
+- `common/web/GlobalExceptionHandler.handleUnreadable`: added a cause-chain walk that delegates to `handleDomain(...)` when a `JsonDeserializer` throws a `DomainException` through Jackson's wrapping. Needed for D4 to actually work end-to-end (see "Bugs caught" §1).
+- `common/web/GlobalExceptionHandler`: new `@ExceptionHandler(NoResourceFoundException.class)` arm → 404 `NOT_FOUND` with a descriptive message (deferred from slice 1, now exercised by `UserControllerWebMvcTest#should_return404_whenEndpointMissing`).
+- `users/domain/User`: `@Entity` extending `BaseEntity`; table-level `@UniqueConstraint` on `username` and `email` (named `uk_users_username`/`uk_users_email` so the H2 / Postgres error messages are recognizable); `@JsonIgnore` on `passwordHash` as defense-in-depth.
+- `users/repository/UserRepository`: derived queries `findByUsername`, `findByEmail`, `existsByUsername`, `existsByEmail`. Existence checks let the service pre-empt duplicates and emit the spec'd feature-specific 409 codes.
+- `users/service/UserService`: `@Transactional` class-level, `@Transactional(readOnly = true)` on the two read methods. Pre-check then insert pattern; update relies on JPA dirty-checking (no explicit `save`); username/email/passwordHash are *not* mutated on update per spec 01 §6.
+- `users/api/CreateUserRequest`: record, `@NotBlank` + `@Pattern(^[A-Za-z0-9_]{3,32}$)` on username, `@Email` on email, `@Size(min=8, max=128)` + no-whitespace `@Pattern` on password, `@JsonDeserialize(using = RoleJsonDeserializer.class)` on role.
+- `users/api/UpdateUserRequest`: record with only `fullName` + `role` (extra fields fall on the floor — spec 01 §6 requires silent ignore).
+- `users/api/UserResponse`: record built via static `from(User)` factory; no `passwordHash` field present.
+- `users/api/RoleJsonDeserializer`: throws `ValidationException(USER_INVALID_ROLE, …, details=[{field:"role", issue:"must be one of [ADMIN, DEVELOPER]"}])` on unknown values.
+- `users/api/UserController`: thin (delegates only). 5 endpoints exactly as the README dictates; `@ResponseStatus(OK)` on create (D3); `@ResponseStatus(NO_CONTENT)` on delete (REST convention since the spec doesn't dictate). Class JavaDoc explicitly documents the 200-on-create divergence so reviewers see we considered 201.
+- `.cursor/rules/30-testing.mdc`: added a "Gotchas (learned the hard way)" section capturing the slice-1 `@WebMvcTest` inner-controller lesson and the "always assert `$.code` alongside status" rule.
+- `BaseEntityJpaTest`: removed the slice-1 `@EntityScan(basePackageClasses = TestThing.class)` workaround (see "Bugs caught" §2).
+- 3 new test classes, 29 new tests:
+  - `UserRepositoryJpaTest` (5): persist + audit timestamps, duplicate-username, duplicate-email, `findByUsername`, existence checks.
+  - `UserServiceTest` (9): create happy path with password-hash capture, USER_DUPLICATE_USERNAME, USER_DUPLICATE_EMAIL, findById happy + missing, update mutates only allowed fields + JPA dirty-check (no `save` call), update missing target, delete happy + missing.
+  - `UserControllerWebMvcTest` (15): every spec 01 §1–§7 acceptance criterion has at least one test (some have two — happy + error), plus the silent-ignore-extra-fields check for §6, plus the `NoResourceFoundException` bonus.
+
+**Bugs I caught in the agent's first cut (fixed before declaring slice done):**
+1. **`should_return400_whenRoleIsUnknown` returned `MALFORMED_REQUEST` instead of `USER_INVALID_ROLE`.** The agent's `RoleJsonDeserializer` was correct, but Jackson wraps any exception thrown inside a deserializer in `JsonMappingException`, which Spring then wraps in `HttpMessageNotReadableException`. The handler's existing `handleUnreadable` arm caught it first and emitted the generic code — the `handleDomain` arm never saw the `ValidationException`. Diagnostic: `andDo(print())` showed `Resolved Exception = HttpMessageNotReadableException`, exactly what I expected only *after* I checked the stack. Fix: `handleUnreadable` now walks the cause chain and delegates to `handleDomain(...)` if any cause is a `DomainException`. This preserves D4's "per-feature concern stays in per-feature package" intent — the handler change is one generic mechanism, not one feature-specific code.
+2. **`BaseEntityJpaTest` failed to load `ApplicationContext` after `UserRepository` was added.** Slice 1's `@EntityScan(basePackageClasses = TestThing.class)` was a workaround for the "no entities exist yet" state. Now `@DataJpaTest`'s default repo scan finds `UserRepository`, tries to wire it to a `User` entity that the restrictive `@EntityScan` excludes, and the context fails. Fix: removed the `@EntityScan` annotation entirely. The default scan starts at the `@SpringBootApplication` package and finds both `TestThing` (nested in the test class) and `User` (main code). The test still only persists `TestThing`, so the broader scope is harmless. Updated the class JavaDoc to spell out the reasoning so this isn't re-introduced.
+
+**Suggestions I rejected:**
+- AI's first cut of `handleUnreadable` proposed *pattern-matching* `InvalidFormatException` (Jackson's specific subclass for enum failures) and emitting `USER_INVALID_ROLE` directly from the cross-cutting handler. **Rejected** — exactly the coupling I called out in D4. The cause-chain walk for `DomainException` is generic; the per-feature semantics live inside the deserializer where they belong.
+- AI proposed adding `@JsonProperty("password")` annotations everywhere as "documentation." **Rejected** — Jackson already maps the record's `password` component by name; the annotation is noise.
+- AI proposed making `UserResponse` return `passwordHash` "for admin use cases." **Hard rejected** — spec 01 §1 is explicit, and "an admin probably wants it" is not in the spec.
+- AI proposed using `Spring Security`'s `UserDetailsService` here as "prep for slice 3." **Rejected** — that bleeds slice-3 scope (D2). When the security starter lands in slice 3, we'll wire `UserDetailsService` then; right now we'd be inventing a class with no caller.
+
+**Run results:**
+- `./mvnw test` → **`Tests run: 43, Failures: 0, Errors: 0, Skipped: 0` ✅**
+  - Slice-1 carry-over: `IssueFlowApplicationTests` (1), `BaseEntityJpaTest` (2), `GlobalExceptionHandlerTest` (11)
+  - Slice-2 new: `UserServiceTest` (9), `UserRepositoryJpaTest` (5), `UserControllerWebMvcTest` (15)
+- Two log-level `ERROR` lines appear in the output and are expected: (a) `Unhandled exception on /throw/unknown` from `should_map_unknown_to500` deliberately exercising the catch-all; (b) two `Unique index or primary key violation` lines from the repo tests deliberately exercising the unique constraints. Neither indicates a test failure.
+
+**Lessons from slice 2:**
+- "Throw whatever you want from a `JsonDeserializer`" is a lie. Jackson swallows everything into `JsonMappingException`. If a per-feature deserializer is the chosen integration point for emitting a feature-specific error code, the cross-cutting handler MUST unwrap the cause chain — without this, the abstraction silently degrades to the generic code. Now built into `GlobalExceptionHandler` and exercised by a real-world test, not just hypothetically.
+- Slice-1 workarounds become slice-2 bombs. The `@EntityScan` restriction in `BaseEntityJpaTest` was load-bearing at slice 1 and load-shifting at slice 2. Counter-measure: when a test annotation exists *only* because of an absence of code elsewhere, leave a JavaDoc comment ("this restriction can be removed once any feature entity exists") so future me revisits it. I've done this in the new `BaseEntityJpaTest` JavaDoc.
+- The "always assert `$.code` alongside `status()`" rule logged at the end of slice 1 paid off immediately in `should_return400_whenRoleIsUnknown` — without that paired assertion, the test would have passed (got 400, but with the wrong code) and the D4 bug would have shipped silently.
 
 ---
 
