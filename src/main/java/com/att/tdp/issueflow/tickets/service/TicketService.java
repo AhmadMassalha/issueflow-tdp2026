@@ -1,5 +1,8 @@
 package com.att.tdp.issueflow.tickets.service;
 
+import com.att.tdp.issueflow.audit.service.AuditLogService;
+import com.att.tdp.issueflow.common.enums.AuditAction;
+import com.att.tdp.issueflow.common.enums.EntityType;
 import com.att.tdp.issueflow.common.enums.Role;
 import com.att.tdp.issueflow.common.enums.TicketStatus;
 import com.att.tdp.issueflow.common.exception.ConflictException;
@@ -51,6 +54,7 @@ public class TicketService {
     private final TicketRepository tickets;
     private final ProjectRepository projects;
     private final UserRepository users;
+    private final AuditLogService auditLog;
 
     @Transactional(readOnly = true)
     public List<Ticket> findByProjectId(Long projectId) {
@@ -91,7 +95,9 @@ public class TicketService {
         t.setAssigneeId(req.assigneeId());
         t.setDueDate(req.dueDate());
         t.setOverdue(false);    // §5: isOverdue:false on create
-        return tickets.save(t); // @Version starts at 0 on insert
+        Ticket saved = tickets.save(t); // @Version starts at 0 on insert
+        auditLog.log(AuditAction.CREATE, EntityType.TICKET, saved.getId());
+        return saved;
     }
 
     // ---- update -------------------------------------------------------------
@@ -154,6 +160,8 @@ public class TicketService {
         }
 
         // §7: status FSM. No-op (status = current) is allowed per Session-05 D4.
+        TicketStatus statusBefore = existing.getStatus();
+        TicketStatus statusAfter = statusBefore;
         if (req.status() != null && req.status() != existing.getStatus()) {
             if (!existing.getStatus().canTransitionTo(req.status())) {
                 throw new ConflictException(
@@ -165,7 +173,16 @@ public class TicketService {
             // TODO(slice-7): if target == DONE, reject when DependencyService
             // reports any non-DONE blocker for this ticket → TICKET_HAS_OPEN_BLOCKERS.
             existing.setStatus(req.status());
+            statusAfter = req.status();
         }
+
+        // D3: status transition is the one update where a tiny diff string
+        // earns its keep (FSM-level information density). Other field changes
+        // → diff stays null; reviewers can read the controller GET to see them.
+        String diff = (statusBefore != statusAfter)
+                ? "{\"status\":{\"from\":\"" + statusBefore + "\",\"to\":\"" + statusAfter + "\"}}"
+                : null;
+        auditLog.log(AuditAction.UPDATE, EntityType.TICKET, id, diff);
 
         return existing; // JPA dirty-checking persists on commit; @Version increments.
     }
@@ -178,6 +195,7 @@ public class TicketService {
                     ErrorCode.TICKET_NOT_FOUND, "Ticket " + id + " was not found.");
         }
         tickets.deleteById(id); // slice 9 converts to soft delete via @SQLDelete
+        auditLog.log(AuditAction.DELETE, EntityType.TICKET, id);
     }
 
     // ---- helpers ------------------------------------------------------------

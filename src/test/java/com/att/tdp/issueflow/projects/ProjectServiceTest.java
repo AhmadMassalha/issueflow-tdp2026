@@ -8,6 +8,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.att.tdp.issueflow.audit.service.AuditLogService;
 import com.att.tdp.issueflow.common.exception.ConflictException;
 import com.att.tdp.issueflow.common.exception.NotFoundException;
 import com.att.tdp.issueflow.common.exception.ValidationException;
@@ -42,6 +43,10 @@ class ProjectServiceTest {
 
     @Mock
     private UserRepository users;
+
+    /** Slice 7 wiring — see AuditIntegrationTest for cross-cutting proof. */
+    @Mock
+    private AuditLogService auditLog;
 
     @InjectMocks
     private ProjectService service;

@@ -7,6 +7,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.att.tdp.issueflow.audit.service.AuditLogService;
 import com.att.tdp.issueflow.auth.security.IssueFlowUserPrincipal;
 import com.att.tdp.issueflow.comments.api.CreateCommentRequest;
 import com.att.tdp.issueflow.comments.api.PatchCommentRequest;
@@ -51,6 +52,10 @@ class CommentServiceTest {
 
     @Mock
     private TicketRepository tickets;
+
+    /** Slice 7 wiring — see AuditIntegrationTest for cross-cutting proof. */
+    @Mock
+    private AuditLogService auditLog;
 
     @InjectMocks
     private CommentService service;

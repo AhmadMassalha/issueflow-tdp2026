@@ -8,6 +8,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.att.tdp.issueflow.audit.service.AuditLogService;
 import com.att.tdp.issueflow.common.enums.Priority;
 import com.att.tdp.issueflow.common.enums.Role;
 import com.att.tdp.issueflow.common.enums.TicketStatus;
@@ -53,6 +54,10 @@ class TicketServiceTest {
 
     @Mock
     private UserRepository users;
+
+    /** Slice 7 wiring — see AuditIntegrationTest for cross-cutting proof. */
+    @Mock
+    private AuditLogService auditLog;
 
     @InjectMocks
     private TicketService service;

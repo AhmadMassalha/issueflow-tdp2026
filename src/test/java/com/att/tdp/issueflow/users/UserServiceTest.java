@@ -8,6 +8,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.att.tdp.issueflow.audit.service.AuditLogService;
 import com.att.tdp.issueflow.common.enums.Role;
 import com.att.tdp.issueflow.common.exception.ConflictException;
 import com.att.tdp.issueflow.common.exception.NotFoundException;
@@ -43,6 +44,14 @@ class UserServiceTest {
 
     @Mock
     private PasswordEncoder passwordEncoder;
+
+    /**
+     * Slice 7 wiring. Not exercised here (cross-cutting auditing is proven
+     * end-to-end in AuditIntegrationTest); mocked away so the constructor
+     * gets all the deps it expects.
+     */
+    @Mock
+    private AuditLogService auditLog;
 
     @InjectMocks
     private UserService service;

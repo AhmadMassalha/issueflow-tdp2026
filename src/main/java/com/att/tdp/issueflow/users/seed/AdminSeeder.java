@@ -1,5 +1,8 @@
 package com.att.tdp.issueflow.users.seed;
 
+import com.att.tdp.issueflow.audit.service.AuditLogService;
+import com.att.tdp.issueflow.common.enums.AuditAction;
+import com.att.tdp.issueflow.common.enums.EntityType;
 import com.att.tdp.issueflow.common.enums.Role;
 import com.att.tdp.issueflow.users.domain.User;
 import com.att.tdp.issueflow.users.repository.UserRepository;
@@ -33,6 +36,7 @@ public class AdminSeeder implements CommandLineRunner {
     private final UserRepository users;
     private final PasswordEncoder passwordEncoder;
     private final AdminSeedProperties props;
+    private final AuditLogService auditLog;
 
     @Override
     @Transactional
@@ -49,7 +53,11 @@ public class AdminSeeder implements CommandLineRunner {
         admin.setFullName(props.fullName());
         admin.setRole(Role.ADMIN);
         admin.setPasswordHash(passwordEncoder.encode(props.password()));
-        users.save(admin);
+        User saved = users.save(admin);
+
+        // Session 07 D10: explicit SYSTEM/CREATE/USER row so reviewers can
+        // trace "who created this user?" back to the boot-time seeder.
+        auditLog.logSystem(AuditAction.CREATE, EntityType.USER, saved.getId(), null);
 
         log.warn("AdminSeeder: created default ADMIN '{}' with the configured password. "
                         + "ROTATE THIS PASSWORD IMMEDIATELY for any non-dev deployment.",

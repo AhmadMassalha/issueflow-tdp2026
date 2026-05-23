@@ -841,6 +841,80 @@ These were necessary to make the spec implementable. Each is reviewed by Ahmad b
 
 ---
 
+## Session 07 — Audit log (cross-cutting)
+**Goal:** `docs/spec/06-audit.md` §1–§6. The biggest slice yet — touches every existing state-changing service (User, Project, Ticket, Comment, Auth, AdminSeeder), introduces the first dynamic-filter query endpoint, and lays down the pagination envelope that slice 10 (mentions) will reuse.
+
+**Decisions surfaced before coding (D1–D10) — user approved all my recommendations:**
+
+| # | Decision | Choice (rationale) |
+|---|---|---|
+| D1 | How to thread `currentUser` into services that don't take it (UserService, ProjectService, TicketService) | **New `CurrentUserProvider` bean** that wraps `SecurityContextHolder` and returns `Optional<IssueFlowUserPrincipal>`. Services inject it; tests mock it. Avoids adding a `principal` arg to every method (5+ touch points × 30+ test methods) and gracefully returns `Optional.empty()` for SYSTEM-actor paths (background jobs in slices 13/14). Comment keeps its explicit param (D6 below) — the two patterns coexist by design: the provider is for services that were previously principal-unaware. |
+| D2 | When in the `@Transactional` to call `auditLogService.log(...)` | **Last call, after the business logic succeeds.** Spec §1 literally says this; rollback wipes the audit row alongside the change. Implemented uniformly across User/Project/Ticket/Comment/Auth. |
+| D3 | Populate `diff` JSON for every change vs. leave it null | **Leave null by default; expose an optional `String diff` param on `log(...)` so callers can pass one where it adds reviewer value** (e.g., status FSM transition). Spec wording: "JSONB nullable … optional". Slice 15 (polish) may backfill more diffs; meanwhile the audit table answers "who did what to which entity?" — the "what changed in detail?" is a nice-to-have. |
+| D4 | Pagination envelope shape (spec §6 just says "standard pagination envelope") | **New `PageResponse<T>` record: `{ items, page, size, totalItems, totalPages }`.** Spring's default `Page<T>` JSON has 10+ fields of Pageable/Sort/last/first cruft — defining our own envelope means clients see only the 5 they need. `PageResponse.of(Page<T>)` static factory does the conversion. Slice 10 (mentions inbox) reuses this. |
+| D5 | `GET /audit-logs` defaults & max page size | **`page=0`, `size=20`, max `size=100`, hard-coded sort `timestamp DESC`.** No client-supplied sort param (spec §6 only sanctions DESC); hard-coding prevents accidental id-sort that would hide recent rows. |
+| D6 | Refactor `CommentService` to use `CurrentUserProvider` for consistency? | **No.** Comment needed the principal for RBAC inside business logic, not just for auditing. Provider is for the cross-cutting "who is auditing this?" lookup. Mixing both patterns is fine; the rule is "use provider where the service was principal-unaware before." Documents that "consistency for its own sake" is the wrong frame. |
+| D7 | New error codes | **None.** No GET-by-id endpoint, so no `AUDIT_LOG_NOT_FOUND`. Filter validation rides on the existing `MethodArgumentTypeMismatchException` handler (slice 1) — unknown `?action=BAD` automatically emits 400 `VALIDATION_FAILED`. Third consecutive slice (after 6) with zero `ErrorCode` change. |
+| D8 | `EntityType` enum (referenced by spec but not yet declared) | **Create `common/enums/EntityType.java`** with all 6 spec-listed values (TICKET, PROJECT, USER, COMMENT, ATTACHMENT, DEPENDENCY). Declaring ATTACHMENT + DEPENDENCY now even though their referrers ship in slices 8 + 12 — same forward-compat play as the slice-1 `AuditAction.AUTO_ESCALATE` pre-seed. |
+| D9 | How to test "every state-changing service writes an audit row" | **One dedicated `AuditIntegrationTest` (`@SpringBootTest`)** that exercises each CRUD via real MockMvc and asserts the right row exists. Existing slice-2/4/5/6 unit tests get a single `@Mock AuditLogService + @Mock CurrentUserProvider` line in setup (no per-test verify) so the constructor wiring still works. Wiring is conceptually different from business logic; one dedicated integration test is more honest than 30 unit-test edits. |
+| D10 | Audit row when `AdminSeeder` creates the default admin at boot | **Yes — write one** with `actor=SYSTEM, performedBy=null, action=CREATE, entityType=USER`. Proves the SYSTEM path end-to-end before slices 13/14 ship, and reviewers will look for "who created this user?" and find a SYSTEM row at t=boot. |
+
+**Obvious / standard items (not separate decisions, recording for the reviewer):**
+- `AuditLog` does **not** extend `BaseEntity` — audit rows are immutable so `updatedAt` would be misleading. Uses `@CreationTimestamp Instant timestamp` directly.
+- `JpaSpecificationExecutor<AuditLog>` on the repository; static `AuditLogSpecifications` helper composes the 4 optional filters with `Specification.where(...).and(...)`. AND-combined per spec §6.
+- Controller method is `@PreAuthorize("hasRole('ADMIN')")` — spec §4 explicitly ADMIN-only. The 403 surfaces via the global handler's `AccessDeniedException` arm (slice 3).
+- `Pageable` is constructed inside the controller (not bound via `@PageableDefault`) so the hard-coded `Sort.by("timestamp").descending()` and the 100-item cap are uniform regardless of client input.
+- The `diff` column is stored as `TEXT`, not Postgres `JSONB`, per spec wording ("stored as string for simplicity") — saves a custom Hibernate type for slice 7 and is round-trippable in H2 tests.
+
+**Touch list for existing files (so the reviewer can sanity-check the cross-cutting blast radius):**
+- `users/service/UserService.java`: ctor +2 deps (`AuditLogService`, `CurrentUserProvider`); `create`/`update`/`delete` each get one `auditLog.log(...)` call.
+- `projects/service/ProjectService.java`: same shape.
+- `tickets/service/TicketService.java`: same shape; status-transition `update` passes a small `diff` string.
+- `comments/service/CommentService.java`: ctor +1 dep (`AuditLogService` — already has `currentUser` param so no provider needed); `create`/`update`/`delete` each get one `log(...)` call.
+- `auth/service/AuthService.java`: ctor +1 dep (`AuditLogService`); `login` writes USER/LOGIN, `logout` writes USER/LOGOUT.
+- `auth/AdminSeeder.java`: ctor +1 dep; emits SYSTEM/CREATE/USER row when the seed user is inserted.
+- Affected unit tests: 1 line in setup per service class (`@Mock AuditLogService` + `@Mock CurrentUserProvider` where applicable). No per-test `verify(auditLog).log(...)` calls — that proof lives in `AuditIntegrationTest`.
+
+**Prompt (verbatim, what's about to drive the implementation):**
+> Build slice 7 (Audit log) per `docs/spec/06-audit.md` §1–§6 and the decisions D1–D10 above. Create the new `audit/` feature module (entity, repo with `JpaSpecificationExecutor`, specifications helper, service, controller, DTOs), plus the `CurrentUserProvider` bean, `PageResponse<T>` envelope, and `EntityType` enum. Then thread `auditLogService.log(...)` calls into UserService / ProjectService / TicketService / CommentService / AuthService / AdminSeeder per the touch list above, each as the last call in its `@Transactional` boundary. Update affected unit tests with the minimum `@Mock` additions to keep constructor wiring green; do NOT add per-test `verify(auditLog).log(...)` — write one `AuditIntegrationTest` (`@SpringBootTest`) that proves the cross-cutting wiring end-to-end (one assertion per state-changing API). Use the existing `ErrorCode` set (no additions needed) and the existing `addFilters=false` Gotcha for `@WebMvcTest`.
+
+**What the AI produced (first pass):**
+- 9 new main-source files: `common/enums/EntityType.java`, `auth/security/CurrentUserProvider.java`, `common/web/PageResponse.java`, `audit/domain/AuditLog.java`, `audit/repository/AuditLogRepository.java`, `audit/repository/AuditLogSpecifications.java`, `audit/service/AuditLogService.java`, `audit/api/AuditLogResponse.java`, `audit/api/AuditLogController.java`.
+- 6 new test classes: `CurrentUserProviderTest` (3 tests), `PageResponseTest` (2), `AuditLogRepositoryJpaTest` (9), `AuditLogServiceTest` (6), `AuditLogControllerWebMvcTest` (9), `AuditIntegrationTest` (16 — covers the 12 state-changing surfaces + login/logout + RBAC + ADMIN happy path).
+- 6 existing services modified (`UserService`, `ProjectService`, `TicketService`, `CommentService`, `AuthService`, `AdminSeeder`) with the `log(...)` call as the last statement in each state-changing method.
+- 4 existing unit-test classes updated with a single `@Mock private AuditLogService auditLog;` line each (`UserServiceTest`, `ProjectServiceTest`, `TicketServiceTest`, `CommentServiceTest`). `AuditLogService.log(...)` invocations there are not verified — that proof lives in `AuditIntegrationTest`.
+- One self-correction during implementation (not a "bug caught", just an in-flight refinement): added a fourth `log` overload `logAs(performedBy, action, entityType, entityId, diff)` after realising that `AuthService.login(...)` is invoked BEFORE the `SecurityContext` is populated for that request — so the standard `log(...)` would have written `actor=SYSTEM` for every login. The overload lets the login path supply the user id explicitly.
+
+**Bugs caught by the test pass (slice-7 lessons logged in `.cursor/rules/30-testing.mdc`):**
+1. **H2 cross-class data leak (`AuditLogRepositoryJpaTest` ↔ `AuditIntegrationTest`):** the integration test (deliberately not `@Transactional` — see D9 commentary) committed audit rows that survived into the in-memory H2 instance, so `@DataJpaTest` count assertions in the repository test were off by one (e.g. "expected 5 rows, got 6"). **Fix:** added `repo.deleteAll(); em.flush()` at the top of the repository test's `@BeforeEach`, plus a JavaDoc explaining why. New Gotcha added to the rules file. Cost: 5 minutes.
+2. **`@WebMvcTest` + custom `@EnableMethodSecurity` import → 404 on every URL:** my first attempt at testing the 403 branch in `AuditLogControllerWebMvcTest` added a nested `@Configuration @EnableMethodSecurity` class. With method security enabled, Spring's AOP proxy around the controller bean somehow broke `RequestMappingHandlerMapping`'s scan — every URL returned 404 (the controller was never registered). **Fix:** moved the RBAC tests (DEVELOPER → 403, ADMIN → 200) to `AuditIntegrationTest` where the real filter chain enforces the rule end-to-end. Documented in the controller test's class-level JavaDoc and as a new Gotcha. Cost: 10 minutes.
+3. **Non-RESTful endpoint (`POST /users/update/{id}`) mistyped as `PATCH /users/{id}` in `AuditIntegrationTest`:** spec 01's user-update endpoint is `POST /users/update/{id}` (idiosyncratic but predates slice 7 and out of scope to refactor). The test failed with `Status expected:<200> but was:<500>`. **Fix:** grepped `UserController` for the actual mapping and updated the test. Cost: 2 minutes. Added to the Gotchas as "verify HTTP verbs by reading the controller, not by REST conventions".
+4. **Username validation rejected `"new-user"` (hyphen not in `[A-Za-z0-9_]{3,32}`):** my first POST body in the user-create audit test used a hyphenated username and got 400 from bean validation. **Fix:** changed to `"newuser"`. Cost: 1 minute. (No new Gotcha — the validation rule has been in place since slice 1; this was a typo in fixture data.)
+5. **`TicketType.TASK` doesn't exist (only `BUG`/`FEATURE`/`TECHNICAL`):** my test body used `"type":"TASK"`. Compile-time failure caught immediately; switched to `FEATURE`. Cost: 1 minute.
+
+Total time spent on the five test-pass bugs: ~20 minutes — none of them required changing main-source code, all were test-fixture / test-config issues. The main-source code was correct from the first AI pass (third consecutive slice with a zero-rework main-source pass).
+
+**Manual changes to AI output (main source):** none.
+
+**Rejected AI suggestions (recorded so future-me doesn't undo them):**
+- *"Add a `findAllForTest()` method to `AuditLogService` so the integration test can read all rows without injecting the repository."* — rejected and removed mid-implementation. The integration test should inject the repository directly; adding a "for-tests" method to production code is a smell that bleeds test concerns into the service. The repository is package-public and trivially autowirable.
+- *"Use `REQUIRES_NEW` on `AuditLogService.log(...)` so audit rows survive even if the calling transaction rolls back."* — rejected. Spec §1 EXPLICITLY says the opposite ("if the txn rolls back, the audit row rolls back too"). An audit row for a change that didn't actually happen would mislead reviewers worse than no audit row.
+- *"Make `Comment` extend `BaseEntity` and add `updatedAt` to audit rows for consistency."* — rejected. `AuditLog` is immutable; `updatedAt` would be a lie. Documented in the entity's JavaDoc so a future agent doesn't "fix consistency".
+- *"Validate filter enum values explicitly in the controller and emit a custom `AUDIT_INVALID_FILTER` error code."* — rejected. The existing `handleTypeMismatch` arm in `GlobalExceptionHandler` (slice 1) already turns unknown `?action=BAD` into 400 `VALIDATION_FAILED`. New code = no value.
+
+**What broke in existing tests, and why:** 23 existing unit-test methods failed on the first `mvn test` with `NullPointerException: this.auditLog is null` — exactly the expected fallout from adding `AuditLogService` to four service constructors without adding `@Mock private AuditLogService auditLog;` to their `@ExtendWith(MockitoExtension.class)` test classes. **Fix:** one line added to four test classes. No further test edits were needed; the existing `@Mock` lookup path filled in `auditLog` automatically.
+
+**Run results:**
+- `./mvnw test` after all fixes: **227 / 227 green** (182 carried from slice 6 + 45 new).
+- Per new test class: `CurrentUserProviderTest` 3/3, `PageResponseTest` 2/2, `AuditLogRepositoryJpaTest` 9/9, `AuditLogServiceTest` 6/6, `AuditLogControllerWebMvcTest` 9/9, `AuditIntegrationTest` 16/16.
+- Suite wall time: ~7 seconds (no regression vs slice 6).
+- Zero changes to `ErrorCode` — third consecutive slice with no error-code additions.
+
+**Lessons for the project rules file (`.cursor/rules/30-testing.mdc`):**
+Three new Gotchas added — H2 cross-class persistence, `@WebMvcTest` × `@EnableMethodSecurity` incompatibility, and the "verify HTTP verbs from the controller, not REST conventions" rule. The first two will pay off again whenever a future slice adds another `@WebMvcTest` that needs method security, or whenever the polluter / pollutee asymmetry recurs (slice 10 mentions inbox + slice 11 attachments will likely both have integration tests).
+
+---
+
 ## Template for future sessions (copy-paste, don't leave empty)
 ```
 ## Session NN — <slice name>

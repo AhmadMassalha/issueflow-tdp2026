@@ -1,5 +1,8 @@
 package com.att.tdp.issueflow.users.service;
 
+import com.att.tdp.issueflow.audit.service.AuditLogService;
+import com.att.tdp.issueflow.common.enums.AuditAction;
+import com.att.tdp.issueflow.common.enums.EntityType;
 import com.att.tdp.issueflow.common.exception.ConflictException;
 import com.att.tdp.issueflow.common.exception.NotFoundException;
 import com.att.tdp.issueflow.common.web.ErrorCode;
@@ -35,6 +38,7 @@ public class UserService {
 
     private final UserRepository users;
     private final PasswordEncoder passwordEncoder;
+    private final AuditLogService auditLog;
 
     @Transactional(readOnly = true)
     public List<User> findAll() {
@@ -67,7 +71,9 @@ public class UserService {
         u.setFullName(req.fullName());
         u.setRole(req.role());
         u.setPasswordHash(passwordEncoder.encode(req.password()));
-        return users.save(u);
+        User saved = users.save(u);
+        auditLog.log(AuditAction.CREATE, EntityType.USER, saved.getId());
+        return saved;
     }
 
     @PreAuthorize("hasRole('ADMIN')")
@@ -76,6 +82,7 @@ public class UserService {
         u.setFullName(req.fullName());
         u.setRole(req.role());
         // username / email / passwordHash are intentionally NOT mutated here per spec 01 §6.
+        auditLog.log(AuditAction.UPDATE, EntityType.USER, id);
         return u; // dirty checking persists on commit
     }
 
@@ -86,5 +93,6 @@ public class UserService {
                     ErrorCode.USER_NOT_FOUND, "User " + id + " was not found.");
         }
         users.deleteById(id);
+        auditLog.log(AuditAction.DELETE, EntityType.USER, id);
     }
 }

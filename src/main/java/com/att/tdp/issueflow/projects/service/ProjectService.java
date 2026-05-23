@@ -1,5 +1,8 @@
 package com.att.tdp.issueflow.projects.service;
 
+import com.att.tdp.issueflow.audit.service.AuditLogService;
+import com.att.tdp.issueflow.common.enums.AuditAction;
+import com.att.tdp.issueflow.common.enums.EntityType;
 import com.att.tdp.issueflow.common.exception.ConflictException;
 import com.att.tdp.issueflow.common.exception.NotFoundException;
 import com.att.tdp.issueflow.common.exception.ValidationException;
@@ -34,6 +37,7 @@ public class ProjectService {
 
     private final ProjectRepository projects;
     private final UserRepository users;
+    private final AuditLogService auditLog;
 
     @Transactional(readOnly = true)
     public List<Project> findAll() {
@@ -66,7 +70,9 @@ public class ProjectService {
         p.setName(req.name());
         p.setDescription(req.description());
         p.setOwnerId(req.ownerId());
-        return projects.save(p);
+        Project saved = projects.save(p);
+        auditLog.log(AuditAction.CREATE, EntityType.PROJECT, saved.getId());
+        return saved;
     }
 
     public Project update(Long id, PatchProjectRequest req) {
@@ -100,6 +106,7 @@ public class ProjectService {
             existing.setDescription(req.description());
         }
 
+        auditLog.log(AuditAction.UPDATE, EntityType.PROJECT, id);
         return existing; // dirty checking persists on commit
     }
 
@@ -109,5 +116,6 @@ public class ProjectService {
                     ErrorCode.PROJECT_NOT_FOUND, "Project " + id + " was not found.");
         }
         projects.deleteById(id);
+        auditLog.log(AuditAction.DELETE, EntityType.PROJECT, id);
     }
 }

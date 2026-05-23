@@ -1,9 +1,13 @@
 package com.att.tdp.issueflow.auth.service;
 
+import com.att.tdp.issueflow.audit.service.AuditLogService;
 import com.att.tdp.issueflow.auth.api.LoginRequest;
 import com.att.tdp.issueflow.auth.api.LoginResponse;
 import com.att.tdp.issueflow.auth.jwt.JwtService;
 import com.att.tdp.issueflow.auth.jwt.TokenDenyList;
+import com.att.tdp.issueflow.common.enums.Actor;
+import com.att.tdp.issueflow.common.enums.AuditAction;
+import com.att.tdp.issueflow.common.enums.EntityType;
 import com.att.tdp.issueflow.common.exception.DomainException;
 import com.att.tdp.issueflow.common.web.ErrorCode;
 import com.att.tdp.issueflow.users.domain.User;
@@ -43,8 +47,9 @@ public class AuthService {
     private final PasswordEncoder passwordEncoder;
     private final JwtService jwt;
     private final TokenDenyList denyList;
+    private final AuditLogService auditLog;
 
-    @Transactional(readOnly = true)
+    @Transactional
     public LoginResponse login(LoginRequest req) {
         User user = users.findByUsername(req.username()).orElse(null);
 
@@ -64,6 +69,10 @@ public class AuthService {
 
         JwtService.IssuedToken issued = jwt.generate(user);
         log.debug("Issued JWT for user {} (jti={}, exp={})", user.getId(), issued.jti(), issued.expiresAt());
+        // Spec 06: actor=USER, action=LOGIN. SecurityContext isn't populated
+        // yet (this request is what mints the token), so use logAs(...) with
+        // the resolved user id rather than the SecurityContext-aware log(...).
+        auditLog.logAs(user.getId(), AuditAction.LOGIN, EntityType.USER, user.getId(), null);
         return LoginResponse.bearer(issued.token(), issued.expiresInSeconds());
     }
 
@@ -71,6 +80,7 @@ public class AuthService {
      * @param rawToken the JWT string from the {@code Authorization} header (without
      *                 the {@code "Bearer "} prefix).
      */
+    @Transactional
     public void logout(String rawToken) {
         // getJti tolerates already-expired tokens (it's effectively idempotent then).
         String jti = jwt.getJti(rawToken);
@@ -89,6 +99,11 @@ public class AuthService {
         }
         denyList.add(jti, exp);
         log.debug("Revoked JWT jti={} (exp={})", jti, exp);
+        // Logout is hit by an authenticated request, so the SecurityContext IS
+        // populated → log(...) routes through CurrentUserProvider and writes
+        // actor=USER with the right performedBy. entityId is null because the
+        // action is principal-scoped, not user-row-scoped.
+        auditLog.log(AuditAction.LOGOUT, EntityType.USER, null);
     }
 
     /** Surfaced as 401 {@code AUTH_INVALID_CREDENTIALS} by the global handler. */

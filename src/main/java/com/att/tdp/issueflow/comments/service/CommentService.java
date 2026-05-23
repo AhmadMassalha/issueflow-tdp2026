@@ -1,10 +1,13 @@
 package com.att.tdp.issueflow.comments.service;
 
+import com.att.tdp.issueflow.audit.service.AuditLogService;
 import com.att.tdp.issueflow.auth.security.IssueFlowUserPrincipal;
 import com.att.tdp.issueflow.comments.api.CreateCommentRequest;
 import com.att.tdp.issueflow.comments.api.PatchCommentRequest;
 import com.att.tdp.issueflow.comments.domain.Comment;
 import com.att.tdp.issueflow.comments.repository.CommentRepository;
+import com.att.tdp.issueflow.common.enums.AuditAction;
+import com.att.tdp.issueflow.common.enums.EntityType;
 import com.att.tdp.issueflow.common.enums.Role;
 import com.att.tdp.issueflow.common.exception.ConflictException;
 import com.att.tdp.issueflow.common.exception.ForbiddenException;
@@ -55,6 +58,7 @@ public class CommentService {
 
     private final CommentRepository comments;
     private final TicketRepository tickets;
+    private final AuditLogService auditLog;
 
     // ---- queries ------------------------------------------------------------
 
@@ -92,7 +96,9 @@ public class CommentService {
         c.setAuthorId(currentUser.id());
         c.setContent(req.content());
         // TODO(slice-10): MentionExtractor.extract(req.content()) → persist Mention rows in the same transaction.
-        return comments.save(c); // @Version starts at 0 on insert
+        Comment saved = comments.save(c); // @Version starts at 0 on insert
+        auditLog.log(AuditAction.CREATE, EntityType.COMMENT, saved.getId());
+        return saved;
     }
 
     // ---- update -------------------------------------------------------------
@@ -142,6 +148,7 @@ public class CommentService {
             // the upper bound; slice 10 owns the regex.
         }
 
+        auditLog.log(AuditAction.UPDATE, EntityType.COMMENT, commentId);
         return existing;
     }
 
@@ -156,6 +163,7 @@ public class CommentService {
         Comment existing = loadOrThrow(commentId, ticketId);
         assertAuthorOrAdmin(existing, currentUser);
         comments.delete(existing);
+        auditLog.log(AuditAction.DELETE, EntityType.COMMENT, commentId);
     }
 
     // ---- helpers ------------------------------------------------------------
