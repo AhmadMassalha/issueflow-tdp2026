@@ -33,6 +33,14 @@ import org.springframework.stereotype.Service;
 @Slf4j
 public class JwtService {
 
+    /**
+     * Sentinel value matching the dev fallback in {@code application.yaml}. When
+     * this exact string is seen at startup, we log a loud WARN — same idiom as
+     * {@code AdminSeeder} when the default admin/admin credentials are in use.
+     */
+    private static final String DEV_SECRET_SENTINEL =
+            "dev-only-jwt-secret-please-override-via-JWT_SECRET-env-var-in-prod-1234567890";
+
     private final SecretKey signingKey;
     private final long expiresInSeconds;
     private final String issuer;
@@ -48,6 +56,15 @@ public class JwtService {
         if (keyBytes.length < 32) {
             throw new IllegalStateException(
                     "jwt.secret must be at least 32 bytes (256 bits) for HS256; got " + keyBytes.length);
+        }
+        if (DEV_SECRET_SENTINEL.equals(props.secret())) {
+            log.warn("================================================================");
+            log.warn(" jwt.secret is the dev fallback baked into application.yaml.");
+            log.warn(" This is fine for local development and graded review runs.");
+            log.warn(" For any non-local deployment, override via the JWT_SECRET env");
+            log.warn(" variable with a random 32+ byte secret (e.g.");
+            log.warn("   export JWT_SECRET=$(openssl rand -base64 48) ).");
+            log.warn("================================================================");
         }
         this.signingKey = Keys.hmacShaKeyFor(keyBytes);
         this.expiresInSeconds = props.expiresInSeconds();

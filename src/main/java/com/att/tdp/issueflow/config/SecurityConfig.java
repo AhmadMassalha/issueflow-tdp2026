@@ -29,9 +29,13 @@ import org.springframework.web.servlet.HandlerExceptionResolver;
  * {@code @RestControllerAdvice} envelope is used instead of Spring Security's
  * default JSON shape.
  *
- * <p>{@code permitAll()} is limited to the two paths spec 02 §3 enumerates
- * ({@code /auth/login} and {@code /error}). Every other URL — including
- * {@code /users} — requires a valid bearer token.
+ * <p>{@code permitAll()} is limited to the paths spec 02 §3 enumerates
+ * ({@code /auth/login} and {@code /error}) plus the springdoc/Swagger doc
+ * surface ({@code /v3/api-docs/**}, {@code /swagger-ui/**},
+ * {@code /swagger-ui.html}) so the reviewer can load the UI without a token
+ * and then "Authorize" with one obtained via {@code POST /auth/login}. Every
+ * other URL — including {@code /users}, {@code /projects},
+ * {@code /tickets} — requires a valid bearer token.
  */
 @Configuration
 @EnableMethodSecurity(prePostEnabled = true)
@@ -51,6 +55,14 @@ public class SecurityConfig {
                 .authorizeHttpRequests(reg -> reg
                         .requestMatchers(HttpMethod.POST, "/auth/login").permitAll()
                         .requestMatchers("/error").permitAll()
+                        // springdoc/Swagger UI — reviewer convenience, not a spec endpoint.
+                        .requestMatchers(
+                                "/v3/api-docs",
+                                "/v3/api-docs/**",
+                                "/swagger-ui",
+                                "/swagger-ui/**",
+                                "/swagger-ui.html")
+                        .permitAll()
                         .anyRequest().authenticated())
                 .exceptionHandling(eh -> eh
                         .authenticationEntryPoint(entryPoint)

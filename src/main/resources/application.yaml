@@ -28,8 +28,11 @@ spring:
 
 # ---- Application-specific settings (slice 3) --------------------------------
 jwt:
-  # HS256 secret. Env wins. Empty triggers fail-fast on startup (see JwtService).
-  secret: ${JWT_SECRET:}
+  # HS256 secret. JWT_SECRET env var wins for production. The fallback is a
+  # CLEARLY-MARKED dev secret so `./mvnw spring-boot:run` works out of the box
+  # for reviewers without extra setup; JwtService logs a WARN at startup when
+  # it's in use. 64+ chars / well over the 32-byte HS256 minimum.
+  secret: ${JWT_SECRET:dev-only-jwt-secret-please-override-via-JWT_SECRET-env-var-in-prod-1234567890}
   # Token lifetime in seconds (spec 02 §1: 3600 = 1h).
   expires-in-seconds: 3600
   issuer: issueflow

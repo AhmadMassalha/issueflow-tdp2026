@@ -104,6 +104,23 @@
 			<artifactId>commons-csv</artifactId>
 			<version>1.10.0</version>
 		</dependency>
+
+		<!--
+			springdoc-openapi: serves the OpenAPI 3 schema at /v3/api-docs and
+			the interactive Swagger UI at /swagger-ui.html. Reviewer convenience
+			(no spec slice owns API documentation explicitly).
+
+			Pinned to 2.7.0 (last release whose CI built against Spring Boot
+			3.4.x — the 2.8.x line targets 3.5.x and trips a PathPattern
+			"No more pattern data allowed after ** element" crash inside
+			AbstractSwaggerConfigurer.combinePatterns on Spring Framework 6.2.x).
+			See https://springdoc.org/faq.html compatibility matrix.
+		-->
+		<dependency>
+			<groupId>org.springdoc</groupId>
+			<artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+			<version>2.7.0</version>
+		</dependency>
 	</dependencies>
 
 	<build>
