@@ -6,6 +6,7 @@ import com.att.tdp.issueflow.common.enums.EntityType;
 import com.att.tdp.issueflow.common.enums.Role;
 import com.att.tdp.issueflow.common.enums.TicketStatus;
 import com.att.tdp.issueflow.common.exception.ConflictException;
+import com.att.tdp.issueflow.dependencies.service.DependencyService;
 import com.att.tdp.issueflow.common.exception.NotFoundException;
 import com.att.tdp.issueflow.common.exception.ValidationException;
 import com.att.tdp.issueflow.common.web.ApiError;
@@ -34,9 +35,9 @@ import org.springframework.transaction.annotation.Transactional;
  *   <li>§4 "DEVELOPER active in that project" check — slice 13 (project
  *       membership). For now, we validate only the role half: assignee must
  *       exist and have {@link Role#DEVELOPER}. Session-05 D1 / prompts.md.</li>
- *   <li>§9 "transition to DONE blocked by open blockers" — slice 7 will wire
- *       a check here once {@code DependencyService} exists. No stub now per
- *       the "no premature abstraction" rule.</li>
+ *   <li>§9 "transition to DONE blocked by open blockers" — wired in slice 8
+ *       via {@link DependencyService#hasOpenBlockers(Long)}, called inside
+ *       the FSM block below before applying the new status.</li>
  *   <li>§11 soft delete — slice 9 swaps storage via {@code @SQLDelete}; for
  *       slice 5 {@link #delete} is a hard delete consistent with the existing
  *       {@code UserService}/{@code ProjectService} pattern.</li>
@@ -55,6 +56,7 @@ public class TicketService {
     private final ProjectRepository projects;
     private final UserRepository users;
     private final AuditLogService auditLog;
+    private final DependencyService dependencies;
 
     @Transactional(readOnly = true)
     public List<Ticket> findByProjectId(Long projectId) {
@@ -170,8 +172,18 @@ public class TicketService {
                                 + " to " + req.status() + ". Allowed next: "
                                 + existing.getStatus().next().map(Enum::name).orElse("(none — DONE is terminal)"));
             }
-            // TODO(slice-7): if target == DONE, reject when DependencyService
-            // reports any non-DONE blocker for this ticket → TICKET_HAS_OPEN_BLOCKERS.
+            // Spec 04 §9 (Session 08 D3): transitioning to DONE requires every
+            // blocker to be DONE itself. Checked AFTER the FSM allowed-edges
+            // gate (so we still return TICKET_INVALID_TRANSITION on a forbidden
+            // path) but BEFORE applying the status (so the audit row + version
+            // bump only happen when the change actually goes through).
+            if (req.status() == TicketStatus.DONE && dependencies.hasOpenBlockers(id)) {
+                throw new ConflictException(
+                        ErrorCode.TICKET_HAS_OPEN_BLOCKERS,
+                        "Cannot mark ticket " + id + " DONE: it has open blockers. "
+                                + "Resolve all blockers first or query GET /tickets/" + id
+                                + "/dependencies for the list.");
+            }
             existing.setStatus(req.status());
             statusAfter = req.status();
         }

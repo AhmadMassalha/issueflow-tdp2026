@@ -915,6 +915,82 @@ Three new Gotchas added — H2 cross-class persistence, `@WebMvcTest` × `@Enabl
 
 ---
 
+## Session 08 — Ticket dependencies + cross-feature DONE-blocker (spec 07)
+**Goal:** `docs/spec/07-dependencies.md` §1–§8 (three endpoints, composite-key join entity, cycle detection, GET-blocker projection) + the cross-feature TICKET_HAS_OPEN_BLOCKERS check that was TODO'd in `TicketService.update(...)` since slice 5.
+
+**Decisions surfaced before coding (D1–D10) — user approved all my recommendations:**
+
+| # | Decision | Choice (rationale) |
+|---|---|---|
+| D1 | Composite-key modeling for `ticket_dependency(ticket_id, blocker_id)` | **Surrogate `Long id` + DB-level `@UniqueConstraint(ticket_id, blocker_id)`.** Plain `BaseEntity` subclass — no `@IdClass`/`@EmbeddedId`. The audit log's `entityId` column is `Long`; a composite key would force lossy encoding-as-string or losing the entity link entirely. Composite uniqueness is still enforced at the DB level; we just don't expose it as the primary identifier in the JPA mapping. |
+| D2 | Cycle detection algorithm | **Java BFS from `blockerId`, depth-cap 100, batched-per-level fetch.** Spec §4 wording verbatim. SQL recursive CTE would be slightly faster on huge graphs but harder to test on H2 and overkill for typical project sizes; the Java implementation does one `IN (...)` query per BFS level, so it's not N+1 — just N-frontier-levels (typically ≤3). |
+| D3 | When does the DONE-blocker check fire in `TicketService.update(...)`? | **Inside the FSM block, BEFORE applying the new status, via `DependencyService.hasOpenBlockers(ticketId)`.** Wires the TODO that's been sitting in `TicketService` since slice 5 (mislabeled as "slice-7" — the label is wrong, the slice number from the plan is 8). Throws `ConflictException(TICKET_HAS_OPEN_BLOCKERS, …)` (already in `ErrorCode` from slice 1). |
+| D4 | Circular DI risk between `TicketService` and `DependencyService`? | **No.** `TicketService → DependencyService` is one-way. `DependencyService` reads ticket rows via `TicketRepository`, not via `TicketService`. Clean DI graph. |
+| D5 | `GET /tickets/{ticketId}/dependencies` response shape | **`List<BlockerSummary>` where `BlockerSummary = {id, title, status}`** via a single JPQL JOIN. Spec §5 verbatim. Avoids the two-trip "find dep ids then bulk-fetch tickets" pattern that would N+1 from a future list view. |
+| D6 | RBAC on dependency endpoints | **Any authenticated user.** Spec is silent; matches Projects/Tickets default (ADR 0006). ADMIN-only would be too restrictive — PMs and devs need to manage dependencies. |
+| D7 | Validation order in `POST /dependencies` | **1) self-dep → `DEPENDENCY_SELF`, 2) both tickets exist → `TICKET_NOT_FOUND`, 3) same project → `DEPENDENCY_DIFFERENT_PROJECT`, 4) duplicate → `DEPENDENCY_EXISTS`, 5) cycle → `DEPENDENCY_CYCLE`.** Cheapest checks first; cycle (the BFS) last. The order is part of the contract — each test asserts the FIRST validation that fires for an input that hits multiple. |
+| D8 | `DELETE /tickets/{tid}/dependencies/{bid}` semantics + tenancy | **404 `DEPENDENCY_NOT_FOUND` when row doesn't exist; 204 on success; tenancy via composite lookup** (`findByTicketIdAndBlockerId` — the URL's `ticketId` must match the row's `ticket_id`). Same anti-information-leak idiom as slice-6 comment tenancy. |
+| D9 | Audit entries for dependency operations | **`CREATE` on add, `DELETE` on remove, `entityType=DEPENDENCY, entityId=dep.id`** (D1's surrogate). No `UPDATE` — dependencies aren't editable. |
+| D10 | Test coverage for cycle detection | **Three positive cases (1-hop, 2-hop, 3-hop), one fan-in negative** (multiple paths to same node → still NOT a cycle), one depth-cap test (101-long chain → BFS aborts cleanly without StackOverflow). Five tests total exercise the algorithm's correctness AND the safety cap. |
+
+**Obvious / standard items (not separate decisions):**
+- `TicketDependency` extends `BaseEntity` — gets `id`, `createdAt`, `updatedAt`. We don't expose `updatedAt` to clients (deps aren't updateable) but `createdAt` is useful for audit forensics and is free.
+- No `@Version` on `TicketDependency` — it has no editable fields, so optimistic locking is moot.
+- `DependencyService.hasOpenBlockers(ticketId)` returns `boolean`, not a list — `TicketService` only needs the yes/no answer. If we later need the blocker list in the error message, that's a one-line refactor (and the error message can build it from the `GET` endpoint already).
+- The audit row for ADD is written with `entityId = dep.getId()` AFTER the save. For DELETE, we capture the id BEFORE delete (otherwise the entity is gone).
+- Zero new `ErrorCode` additions — all 5 dependency codes + `TICKET_HAS_OPEN_BLOCKERS` were pre-seeded in slice 1. **Fourth** consecutive slice with no `ErrorCode` changes.
+
+**Touch list:**
+- New main source (6 files): `dependencies/{domain/TicketDependency.java, repository/{TicketDependencyRepository.java, BlockerSummary.java}, service/DependencyService.java, api/{AddDependencyRequest.java, DependencyController.java}}`.
+- Modified main source (1 file): `tickets/service/TicketService.java` — constructor +1 dep, TODO replaced with `if (req.status() == DONE && dependencies.hasOpenBlockers(id)) throw ...`. Also fix the misleading "TODO(slice-7)" comment label.
+- Modified tests (1 file): `tickets/TicketServiceTest.java` — `@Mock DependencyService` line + 2 new tests for the DONE-blocker arm (allow when zero blockers, reject when ≥1 open blocker).
+- New tests (4 files): `TicketDependencyRepositoryJpaTest`, `DependencyServiceTest`, `DependencyControllerWebMvcTest`, `DependencyIntegrationTest` (`@SpringBootTest` for the audit-row + cross-feature DONE-blocker proof; must wipe in `@BeforeEach` per the slice-7 H2 cross-class Gotcha).
+
+**Prompt (verbatim):**
+> Build slice 8 (Ticket dependencies) per `docs/spec/07-dependencies.md` and decisions D1–D10 above. Create the `dependencies/` feature module: entity (BaseEntity subclass with surrogate id + `@UniqueConstraint(ticket_id, blocker_id)`), repository, BFS-based cycle detection in the service, three endpoints, audit calls. Wire `DependencyService.hasOpenBlockers(...)` into `TicketService.update(...)` inside the FSM block for the DONE transition; remove the misleading "TODO(slice-7)" comment and write the actual check. Update `TicketServiceTest` with `@Mock DependencyService` and two new tests for the DONE-blocker arm. Tests: `TicketDependencyRepositoryJpaTest` (persistence + unique constraint), `DependencyServiceTest` (all 5 validation arms in order + cycle detection 1-hop/2-hop/3-hop/fan-in-negative/depth-cap), `DependencyControllerWebMvcTest` (HTTP contract), `DependencyIntegrationTest` (`@SpringBootTest` — cross-feature DONE-blocker + audit row written on add/remove; defensive `deleteAll()` per slice-7 Gotcha).
+
+**AI output (files shipped exactly as designed — no manual rewrites of the service code):**
+
+| File | Notes |
+|---|---|
+| `dependencies/domain/TicketDependency.java` (NEW) | `BaseEntity` subclass; `@UniqueConstraint(ticket_id, blocker_id)`; secondary `blocker_id` index for cycle-BFS reverse lookups; JavaDoc explains D1. |
+| `dependencies/repository/TicketDependencyRepository.java` (NEW) | 5 queries: `findByTicketId` (debugging), `findByTicketIdAndBlockerId` (tenancy), `existsByTicketIdAndBlockerId` (duplicate), `findBlockerSummariesByTicketId` (GET projection JOIN), `findBlockerIdsByTicketIds` (BFS batching), `countOpenBlockers` (cross-feature DONE-guard count). |
+| `dependencies/repository/BlockerSummary.java` (NEW) | JPQL projection record `(id, title, status)` — spec §5 verbatim. |
+| `dependencies/service/DependencyService.java` (NEW) | 5-arm validation in documented order; BFS with `MAX_BFS_DEPTH=100`; `hasOpenBlockers(...)` returns `boolean` (no list — caller doesn't need it). Visited-set dedup + iterative loop (no stack risk). |
+| `dependencies/api/AddDependencyRequest.java` (NEW) | `@NotNull @Positive Long blockedBy`. |
+| `dependencies/api/DependencyController.java` (NEW) | 3 endpoints, no `@PreAuthorize` (D6); `POST` returns 201 + a small envelope `AddDependencyResponse(id, ticketId, blockerId)` so the client gets the surrogate. |
+| `tickets/service/TicketService.java` (MODIFIED) | Constructor +1 dep (`DependencyService`); the 2-line `TODO(slice-7)` block became a real 6-line check + 4-line error message. The class JavaDoc's §9 bullet was also updated from "slice 7 will wire" to "wired in slice 8". |
+| `tickets/TicketServiceTest.java` (MODIFIED) | +1 `@Mock DependencyService` field + 2 new tests for the DONE-blocker arm. Each new test stubs `hasOpenBlockers(...)` because that's the SUT branch; the other 23 existing FSM tests don't transition to DONE so they get Mockito's default `false` for free. |
+| `TicketDependencyRepositoryJpaTest` (NEW) | 9 tests: persistence + unique constraint (insert-time) + composite lookup + projection-JOIN sort + BFS batching shape + 3 `countOpenBlockers` scenarios. `@BeforeEach` wipes per slice-7 H2 cross-class Gotcha. |
+| `DependencyServiceTest` (NEW) | 15 tests: 5 validation arms (with order asserted via `verify(...).never()` on the next step's repo call) + 4 cycle scenarios (1-hop/2-hop/3-hop positive, fan-in negative) + depth-100 cap + remove + listBlockers + hasOpenBlockers. |
+| `DependencyControllerWebMvcTest` (NEW) | 11 tests: happy POST + each error code (DEPENDENCY_SELF/DIFFERENT_PROJECT/EXISTS/CYCLE/TICKET_NOT_FOUND) + DTO validation (missing + not-positive) + GET happy + GET 404 + DELETE happy + DELETE 404. |
+| `DependencyIntegrationTest` (NEW) | 5 `@SpringBootTest` tests proving the cross-cutting wiring through the real chain: blocked-DONE-rejected, DONE-allowed-after-blocker-resolved, audit row on ADD, audit row on DELETE, GET smoke test. |
+
+**Zero changes to production code from AI's first pass.** The service was correct on first generation. All bugs caught were in test code.
+
+**Bugs caught during the test pass (2 bugs, both in test code):**
+
+1. **`MAX_BFS_DEPTH` package-private** — `DependencyServiceTest` lived in `com.att.tdp.issueflow.dependencies` (no `.service` suffix), so the constant was unreachable. Could have made it `public`, but instead inlined `100` as a literal in the test with a comment that pins it to the spec — anyone bumping the cap will trip this test AND should add a `prompts.md` entry, which is the right hop.
+2. **`should_rejectDuplicatePair_atDbLevel` asserted on `em::flush`** when the constraint actually fires at `em::persist`. Why: `BaseEntity` uses `GenerationType.IDENTITY` → Hibernate must execute the INSERT inside the `persist(...)` call to get the auto-generated id back synchronously, NOT defer to flush like with sequence-based IDs. **Lesson**: with IDENTITY id generation, `em.persist()` IS the round-trip; flush only matters for updates and cascading. The fix moved the assertion AND added a JavaDoc comment explaining the gotcha — promoted to `.cursor/rules/30-testing.mdc` below.
+
+**Lessons logged to `.cursor/rules/30-testing.mdc`:**
+- *(new gotcha)* "With `GenerationType.IDENTITY`, `em.persist()` issues the INSERT synchronously, not at the next flush. Tests asserting unique-constraint violations should call `assertThatThrownBy(() -> em.persist(dup))`, not `() -> em.flush()`."
+
+**Rejected suggestions (and why):**
+- I rejected my own initial impulse to use `@IdClass` for the composite key — see D1 above. The audit row pointer requirement made the surrogate id cleaner.
+- I rejected an "explain blockers in the error message" extension (returning the open blocker ids inline). The spec doesn't require it; the client can call `GET /dependencies` to render the list. Keeps the error path small.
+- I rejected an "add dependency cascade on hard delete" — irrelevant per ADR 0002 (no hard deletes in this codebase; slice 9 introduces soft-delete and dependency rows become orphaned-but-filtered then).
+
+**Run results:**
+- `./mvnw test`: **270 / 270 green** (+43 from slice 7's 227)
+- New tests: `TicketDependencyRepositoryJpaTest` (9) + `DependencyServiceTest` (15) + `DependencyControllerWebMvcTest` (11) + `DependencyIntegrationTest` (5) + 2 added to `TicketServiceTest` + 1 minor `should_persistSurrogateId_andColumns` is a single test (already counted in 9). Total: 42 new + 1 existing-test reuse.
+- Zero new `ErrorCode` additions (4th consecutive slice).
+- Zero changes to existing service tests (other than `TicketServiceTest`'s mock + 2 tests). The cross-cutting DONE-blocker proof lives in `DependencyIntegrationTest`, not scattered across unit tests — same Session-07 D9 pattern.
+
+**Slice 8 closed.** Next: slice 9 (soft delete + restore).
+
+---
+
 ## Template for future sessions (copy-paste, don't leave empty)
 ```
 ## Session NN — <slice name>

@@ -13,6 +13,7 @@ import com.att.tdp.issueflow.common.enums.Priority;
 import com.att.tdp.issueflow.common.enums.Role;
 import com.att.tdp.issueflow.common.enums.TicketStatus;
 import com.att.tdp.issueflow.common.enums.TicketType;
+import com.att.tdp.issueflow.dependencies.service.DependencyService;
 import com.att.tdp.issueflow.common.exception.ConflictException;
 import com.att.tdp.issueflow.common.exception.NotFoundException;
 import com.att.tdp.issueflow.common.exception.ValidationException;
@@ -58,6 +59,16 @@ class TicketServiceTest {
     /** Slice 7 wiring — see AuditIntegrationTest for cross-cutting proof. */
     @Mock
     private AuditLogService auditLog;
+
+    /**
+     * Slice 8 wiring. The DONE-blocker arm has two dedicated tests below
+     * ({@link #should_allowTransitionToDone_whenNoOpenBlockers},
+     * {@link #should_rejectTransitionToDone_whenOpenBlockersExist}); every
+     * other test stubs {@code hasOpenBlockers(...)} via Mockito's default
+     * (returns false), which mirrors "ticket has no dependencies at all".
+     */
+    @Mock
+    private DependencyService dependencies;
 
     @InjectMocks
     private TicketService service;
@@ -292,6 +303,41 @@ class TicketServiceTest {
                 .isInstanceOf(ConflictException.class)
                 .extracting("code")
                 .isEqualTo(ErrorCode.TICKET_INVALID_TRANSITION);
+    }
+
+    // ---- update: §9 DONE-blocker (slice 8 cross-feature) -------------------
+
+    @Test
+    @DisplayName("Spec 04 §9 (slice 8) — IN_REVIEW → DONE allowed when DependencyService reports no open blockers")
+    void should_allowTransitionToDone_whenNoOpenBlockers() {
+        Ticket cur = existing(1L, TicketStatus.IN_REVIEW, Priority.MEDIUM, 2L);
+        when(tickets.findById(1L)).thenReturn(Optional.of(cur));
+        when(dependencies.hasOpenBlockers(1L)).thenReturn(false);
+
+        PatchTicketRequest req = new PatchTicketRequest(
+                null, null, TicketStatus.DONE, null, null, null, null, 2L);
+
+        Ticket updated = service.update(1L, req);
+
+        assertThat(updated.getStatus()).isEqualTo(TicketStatus.DONE);
+    }
+
+    @Test
+    @DisplayName("Spec 04 §9 (slice 8) — IN_REVIEW → DONE rejected with TICKET_HAS_OPEN_BLOCKERS when blockers remain")
+    void should_rejectTransitionToDone_whenOpenBlockersExist() {
+        Ticket cur = existing(1L, TicketStatus.IN_REVIEW, Priority.MEDIUM, 2L);
+        when(tickets.findById(1L)).thenReturn(Optional.of(cur));
+        when(dependencies.hasOpenBlockers(1L)).thenReturn(true);
+
+        PatchTicketRequest req = new PatchTicketRequest(
+                null, null, TicketStatus.DONE, null, null, null, null, 2L);
+
+        assertThatThrownBy(() -> service.update(1L, req))
+                .isInstanceOf(ConflictException.class)
+                .extracting("code")
+                .isEqualTo(ErrorCode.TICKET_HAS_OPEN_BLOCKERS);
+        // Status was NOT applied — the guard runs BEFORE setStatus.
+        assertThat(cur.getStatus()).isEqualTo(TicketStatus.IN_REVIEW);
     }
 
     // ---- update: §10 priority change clears isOverdue ----------------------
