@@ -120,9 +120,34 @@ public class GlobalExceptionHandler {
 
     // ---- Persistence ------------------------------------------------------------
 
+    /**
+     * Race window between a {@code TicketService}-style version pre-check and JPA flush.
+     *
+     * <p>The service layer typically pre-checks the client-supplied {@code version} against
+     * the entity's {@code @Version} field and throws an immediate
+     * {@code Conflict(TICKET_VERSION_CONFLICT)} (or {@code COMMENT_VERSION_CONFLICT}, etc.)
+     * — see ADR 0001. The exception handled here covers the (rare) case where another
+     * transaction commits between the pre-check and the JPA flush at commit time.
+     *
+     * <p>The persistent class is inspected so feature-specific codes are emitted even on
+     * the safety-net path. Falls back to the generic {@code VERSION_CONFLICT} for entities
+     * not covered (currently none — slice 6 adds Comment).
+     */
     @ExceptionHandler({ObjectOptimisticLockingFailureException.class, OptimisticLockingFailureException.class})
     public ResponseEntity<ApiError> handleOptimisticLock(Exception ex, HttpServletRequest req) {
-        ApiError body = ApiError.of(HttpStatus.CONFLICT, ErrorCode.VERSION_CONFLICT,
+        ErrorCode code = ErrorCode.VERSION_CONFLICT;
+        if (ex instanceof ObjectOptimisticLockingFailureException oolfe) {
+            String entityName = oolfe.getPersistentClassName();
+            if (entityName != null) {
+                String simple = entityName.substring(entityName.lastIndexOf('.') + 1);
+                code = switch (simple) {
+                    case "Ticket" -> ErrorCode.TICKET_VERSION_CONFLICT;
+                    case "Comment" -> ErrorCode.COMMENT_VERSION_CONFLICT;
+                    default -> ErrorCode.VERSION_CONFLICT;
+                };
+            }
+        }
+        ApiError body = ApiError.of(HttpStatus.CONFLICT, code,
                 "The entity was modified by another transaction. Re-fetch and retry.", req.getRequestURI());
         return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
     }

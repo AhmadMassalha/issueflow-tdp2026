@@ -51,6 +51,9 @@ public enum ErrorCode {
     TICKET_INVALID_TRANSITION(HttpStatus.CONFLICT),
     TICKET_DONE_IS_IMMUTABLE(HttpStatus.CONFLICT),
     TICKET_HAS_OPEN_BLOCKERS(HttpStatus.CONFLICT),
+    TICKET_INVALID_STATUS(HttpStatus.BAD_REQUEST),
+    TICKET_INVALID_PRIORITY(HttpStatus.BAD_REQUEST),
+    TICKET_INVALID_TYPE(HttpStatus.BAD_REQUEST),
     INVALID_ASSIGNEE(HttpStatus.UNPROCESSABLE_ENTITY),
 
     // ---- Comment (spec 05) --------------------------------------------------------

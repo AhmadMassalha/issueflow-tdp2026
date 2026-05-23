@@ -690,6 +690,89 @@ These were necessary to make the spec implementable. Each is reviewed by Ahmad b
 
 ---
 
+## Session 05 — Tickets
+**Goal:** `docs/spec/04-tickets.md` §1–§12. The biggest slice — Tickets are the central entity, with optimistic locking (§6), FSM transitions (§7), DONE-is-immutable (§8), and several forward-compat seams for slices 7 (blockers), 9 (soft delete), 13 (auto-assign + project membership), and 14 (escalation).
+
+**Decisions surfaced before coding (D1–D6) — user approved all my recommendations:**
+
+| # | Decision | Choice (rationale) |
+|---|---|---|
+| D1 | `assigneeId` validation on POST when supplied (spec §4 partial) | **Partial implementation:** validate user exists AND `role == DEVELOPER`. The "active in that project" half requires slice 13 (project membership), so we leave a clearly-flagged gap. Slice 13 tightens by adding the membership join. Documents *what's checkable today*, not the deferred half. |
+| D2 | Does PATCH allow reassignment? | **Yes.** Entity has nullable `assigneeId`; only sane way to correct a wrong auto-assignment. Same validation rule as POST. |
+| D3 | Mechanism for `VERSION_REQUIRED` 400 (spec §6) | **DTO field `Long version` nullable, service throws `ValidationException(VERSION_REQUIRED, …)` when null.** Matches the slice-4 D4 pattern of cross-cutting validation in the service. No Bean Validation hack required. |
+| D4 | No-op status transition (PATCH with `status` = current status) | **Allowed.** Doesn't cost anything and avoids forcing clients to surgically omit `status` when PATCHing other fields. The FSM rule fires only when `req.status != null && req.status != existing.status`. |
+| D5 | `DELETE /tickets/{id}` semantics in slice 5 | **Hard delete now; slice 9 converts to soft delete in one place via @SQLDelete + @SQLRestriction (ADR 0002).** Same pattern as users/projects. Endpoint contract stays stable across the conversion. The spec's "no hard-delete endpoint" wording refers to the finished system. |
+| D6 | `description` upper bound | **`@Size(max = 50_000)`.** Tickets carry more detail than projects (where slice 4 used 10K); 50K is 10× typical and bounded enough to refuse trivially malicious payloads. |
+
+**Obvious / standard items (not separate decisions, but recording for the reviewer):**
+- §6 stale-version mapping: implemented in **two layers**:
+  1. *Service-level pre-check.* If `existing.getVersion() != req.version()`, throw `ConflictException(TICKET_VERSION_CONFLICT, …)` immediately. Fast path.
+  2. *Handler-level safety net.* Enhance `GlobalExceptionHandler.handleOptimisticLock` to inspect `ObjectOptimisticLockingFailureException.getPersistentClassName()` and emit `TICKET_VERSION_CONFLICT` when the offending entity is `Ticket`. Covers the race window between the pre-check and the JPA flush (rare but real). Spec §6 literally says "mapped from `ObjectOptimisticLockingFailureException`" — both paths satisfy that wording.
+- Three enum deserializers (`TicketStatusJsonDeserializer`, `PriorityJsonDeserializer`, `TicketTypeJsonDeserializer`) mirror the slice-2 `RoleJsonDeserializer` pattern. Each emits a feature-specific code (`TICKET_INVALID_STATUS`, `TICKET_INVALID_PRIORITY`, `TICKET_INVALID_TYPE` — added to `ErrorCode` this slice). Consistent with the slice-2 precedent of feature-specific bad-enum codes.
+- DTO splits: `CreateTicketRequest` (title, optional description, optional status (default `TODO`), priority, type, projectId, optional assigneeId, optional dueDate); `PatchTicketRequest` (all editable fields nullable + required-via-service `Long version`); `TicketResponse` (every entity field including `isOverdue` and `version` per spec §5).
+- `projectId` query param on `GET /tickets`: `@RequestParam Long projectId` (no default). Spring throws `MissingServletRequestParameterException` → existing handler emits 400 `MISSING_PARAMETER` — §12 satisfied without any new code.
+- Forward-compat hooks NOT pre-stubbed: no empty `DependencyService.hasOpenBlockers(id)` for §9, no empty `AutoAssigner` for §4. Slices 7 and 13 will wire them cleanly when the real services exist. Avoids dead code.
+
+**Prompt (verbatim, drives the implementation):**
+> Build slice 5 (Tickets) per `docs/spec/04-tickets.md` §1–§12 and the decisions D1–D6 above. Mirror the slice-4 (Projects) module layout: `tickets/{domain,repository,api,service}`. Add `@Version Long version` directly on the `Ticket` entity (not pushed to `BaseEntity` — only this entity needs it per ADR 0001). Enhance `GlobalExceptionHandler.handleOptimisticLock` to emit `TICKET_VERSION_CONFLICT` when the persistent class is `Ticket`. Add three enum deserializers and the matching `ErrorCode` entries. Write three test classes covering every §1–§12 acceptance criterion. Use `@AutoConfigureMockMvc(addFilters = false)` per the slice-3 rule.
+
+**What the AI produced (files written / changed):**
+- `common/web/ErrorCode.java`: added `TICKET_INVALID_STATUS`, `TICKET_INVALID_PRIORITY`, `TICKET_INVALID_TYPE` (each 400) for the spec §2 enum-validation contract.
+- `common/web/GlobalExceptionHandler.java`: enhanced `handleOptimisticLock` to inspect `ObjectOptimisticLockingFailureException.getPersistentClassName()` and emit `TICKET_VERSION_CONFLICT` when the offending entity is `Ticket` (fallback `VERSION_CONFLICT`). Pre-seeded `Comment` mapping for slice 6.
+- `tickets/domain/Ticket.java`: full entity with `@Version Long version`, three `@Enumerated(STRING)` columns, `projectId`/`assigneeId` as plain `Long`, `isOverdue` defaulted false, `deletedAt` reserved for slice 9. JavaDoc documents the two-layer optimistic-locking strategy.
+- `tickets/repository/TicketRepository.java`: just `findByProjectId(Long)` — soft-delete filtering becomes automatic in slice 9 when `@SQLRestriction` lands.
+- `tickets/api/TicketStatusJsonDeserializer.java`, `PriorityJsonDeserializer.java`, `TicketTypeJsonDeserializer.java`: three deserializers mirroring the slice-2 `RoleJsonDeserializer`. Each emits its feature-specific 400 code with a `details[{field:…}]` entry pointing at the offending field.
+- DTOs (records): `CreateTicketRequest` (title, optional description, optional status, required priority + type, projectId, optional assigneeId + dueDate), `PatchTicketRequest` (all editable fields nullable + required-via-service `Long version`), `TicketResponse` (every entity field including `isOverdue` and `version` per spec §5).
+- `tickets/service/TicketService.java`: 174-line orchestration that implements §1, §3, §4 (partial per D1), §5 defaults, §6 (version-required + version-stale pre-check), §7 (FSM via `TicketStatus.canTransitionTo` — already present in the enum from slice 1), §8 (DONE is terminal), §10 (priority change clears `isOverdue`), §11 (hard delete for now), with clear `TODO(slice-7)` and `TODO(slice-13)` markers where the deferred specs will plug in.
+- `tickets/api/TicketController.java`: 5 endpoints. `@PatchMapping`. `@RequestParam Long projectId` with no default — Spring throws `MissingServletRequestParameterException` → existing handler emits `MISSING_PARAMETER` (spec §12 satisfied for free). POST returns 200 (Session-02 D3 / slice-4 consistency).
+- `src/test/.../tickets/TicketRepositoryJpaTest.java` (4 tests): persistence + audit + defaults; `@Version` increment proof; stale-version save throws `ObjectOptimisticLockingFailureException`; `findByProjectId` filter.
+- `src/test/.../tickets/TicketServiceTest.java` (20 tests, Mockito): create happy + project-missing + assignee-not-DEVELOPER + assignee-missing + valid assignee; findById missing; PATCH version-required, version-stale, DONE-immutable, FSM happy / no-op / skip / backward, priority-change-clears-isOverdue, same-priority-doesn't-clear, reassign happy, reassign-bad-role, target-missing; delete happy + missing.
+- `src/test/.../tickets/TicketControllerWebMvcTest.java` (19 tests): every Spec 04 §1–§12 acceptance criterion tagged in `@DisplayName`, including the three enum-validation arms, the version-required + version-stale arms, the FSM rejection + happy paths, the DONE-immutable arm, the priority-cleared-isOverdue response shape, the missing-`projectId` MISSING_PARAMETER path, and the standard 404 surface.
+
+**What I changed manually:** *one fix* — the `should_throwOptimisticLock_whenStaleVersion` repository test. See "Bugs caught" below.
+
+**Suggestions I rejected (this slice):**
+- AI proposed using `@Validated @PositiveOrZero Long version` on `PatchTicketRequest` to enforce VERSION_REQUIRED via Bean Validation. **Rejected** — that emits `VALIDATION_FAILED`, not `VERSION_REQUIRED`; the service-level check (D3) gives us the feature-specific code without coupling the global handler to a custom error path.
+- AI proposed making `@ManyToOne Project project` and `@ManyToOne User assignee` associations on `Ticket` "for navigability." **Rejected** — same call as slice 4 (Project's `ownerId`). The flat `{…, projectId, assigneeId, …}` response shape doesn't need JOINs; entity-level FK invariants are enforced at the service layer. JPA associations would add fetch-mode questions (LAZY proxy / N+1) for zero spec benefit.
+- AI proposed pre-stubbing a `DependencyService` with `hasOpenBlockers(ticketId)` returning `false`, ready for slice 7 to fill in. **Rejected** — dead code today; slice 7 will wire it cleanly when the real service exists. Documented as a `TODO(slice-7)` comment at the FSM-DONE branch so the seam is discoverable.
+- AI proposed an `EnumJsonDeserializer<T extends Enum<T>>` with `ContextualDeserializer` to handle all three enums generically. **Rejected** — per-feature codes (`TICKET_INVALID_STATUS` vs `TICKET_INVALID_PRIORITY` vs `TICKET_INVALID_TYPE`) require some per-enum dispatch anyway; three 50-line files are honestly clearer than one 80-line generic with reflection. Matches the slice-2 precedent.
+- AI proposed making PATCH no-op status transitions return 409 (rejecting D4 after the fact). **Rejected** — that was the explicitly-considered alternative in D4. Users will reasonably PATCH a ticket primarily to change priority/description while including the full known state; forcing clients to strip `status` is hostile.
+- AI proposed adding a `LockModeType.OPTIMISTIC_FORCE_INCREMENT` annotation on the read inside `TicketService.update` to "guarantee the version bump." **Rejected** — adds DB round-trips for the noop case (no fields actually changed) and conflicts with the spec-§10 rule that priority *unchanged* should be no-op (forcing a bump would clear `isOverdue` even when priority wasn't touched). The natural JPA flow handles this correctly.
+
+**Bugs caught in the agent's first cut and fixed pre-declaration:**
+
+1. **`TicketRepositoryJpaTest.should_throwOptimisticLock_whenStaleVersion` failed silently — the simulated stale handle was actually the same managed reference as the "fresh" handle.** Initial code:
+   ```java
+   Ticket stale = tickets.findById(saved.getId()).orElseThrow();
+   Ticket fresh = tickets.findById(saved.getId()).orElseThrow();
+   fresh.setTitle("bumped");
+   tickets.saveAndFlush(fresh);
+   em.clear();
+   stale.setTitle("stale write");
+   assertThatThrownBy(() -> tickets.saveAndFlush(stale))   // never threw
+       .isInstanceOf(ObjectOptimisticLockingFailureException.class);
+   ```
+   In a single `@DataJpaTest` transaction, JPA's first-level cache returns the SAME managed object for repeated `findById` calls — `stale == fresh`. Mutating `fresh` mutates `stale`, and by the time `saveAndFlush(stale)` runs the in-memory version is already 1, matching the DB. No conflict, no throw, no test failure detection of an actual scenario. **Fix:** hand-build the "stale" entity as a detached POJO with an explicitly stale `@Version` field (set id + version + mutated fields directly), then `saveAndFlush(stale)` — `merge()` loads the current managed entity (version=1), compares with stale (version=0), and throws `ObjectOptimisticLockingFailureException` at flush time. Confirmed green after the fix.
+   **Lesson logged** to `.cursor/rules/30-testing.mdc` as a new Gotcha so future optimistic-locking tests in slice 6 (Comment) and slice 12 (Audit) don't repeat the trap.
+
+**Run results:**
+- `./mvnw test` → **`Tests run: 145, Failures: 0, Errors: 0, Skipped: 0` ✅** (BUILD SUCCESS).
+  - Slice 1–4 carry-over: 102 tests, all still green.
+  - Slice 5 new: 43 tests across 3 classes — `TicketRepositoryJpaTest` 4, `TicketServiceTest` 20, `TicketControllerWebMvcTest` 19.
+- Spec 04 §1–§12 coverage map: every criterion tagged in `@DisplayName` strings as `Spec 04 §N`. Cross-cutting concerns covered:
+  - **§6 optimistic locking:** repository test (raw JPA throws), service test (fast-path pre-check), controller test (handler maps to `TICKET_VERSION_CONFLICT`).
+  - **§7 FSM:** service-level happy / skip / backward / no-op, all four next() paths exercised; controller-level skip and happy mapped.
+  - **§10 priority-clears-isOverdue:** service test (priority change clears, same-priority doesn't), controller test (response reflects cleared flag).
+
+**Lessons from slice 5:**
+- The optimistic-locking-in-tests gotcha is going to recur for every `@Version`-bearing entity (Comment in slice 6 at minimum). Now it's a `30-testing.mdc` Gotcha — the same pre-emptive investment that's eliminated `addFilters=false` and unwrap-cause-chain bugs across earlier slices.
+- Two-layer enforcement (service pre-check + handler safety net) is the right call for cross-cutting infrastructure like optimistic locking. The fast path gives feature-specific codes immediately for the common case; the handler covers the rare race window. The PR-reviewer summary is one bullet long: "version is checked twice — service pre-empts, handler is the safety net" — vs the alternative "version conflicts produce a generic `VERSION_CONFLICT` and we hope nobody minds."
+- The slice-1 investment in `TicketStatus.canTransitionTo()` + `TicketStatus.next()` paid off: the FSM logic in `TicketService.update` is 4 lines including the error message. If the next state had to be hard-coded in the service, slice 14 (escalation) would need to duplicate the same table.
+- Three 50-line enum-deserializer files vs one 80-line generic with reflection: I went with the former. Clearer to read line-by-line, no surprise about which enum is being deserialized, matches the slice-2 precedent. The cost is ~100 lines of "this looks the same" — acceptable because the per-enum dispatch (feature-specific code) would have to exist somewhere anyway.
+- The slice's biggest decisions (D1 partial assignee validation, D2 PATCH reassignment, D3 service-level VERSION_REQUIRED) were all about acknowledging *what we know now vs. what later slices will add* — and writing the code so the seam is discoverable (`TODO(slice-13)`, `TODO(slice-7)`) without dead-code stubs. That's the same "no premature abstraction" lesson from slice 4.
+
+---
+
 ## Template for future sessions (copy-paste, don't leave empty)
 ```
 ## Session NN — <slice name>
