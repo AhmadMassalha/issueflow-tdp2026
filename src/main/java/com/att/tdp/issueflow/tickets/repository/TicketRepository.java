@@ -2,10 +2,13 @@ package com.att.tdp.issueflow.tickets.repository;
 
 import com.att.tdp.issueflow.tickets.domain.Ticket;
 import java.util.List;
+import java.util.stream.Stream;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.repository.query.Param;
+import jakarta.persistence.QueryHint;
 
 /**
  * Persistence boundary for {@link Ticket}.
@@ -45,4 +48,23 @@ public interface TicketRepository extends JpaRepository<Ticket, Long> {
     @Query(value = "UPDATE tickets SET deleted_at = NULL, version = version + 1 "
             + "WHERE id = :id AND deleted_at IS NOT NULL", nativeQuery = true)
     int restoreById(@Param("id") Long id);
+
+    /**
+     * Cursor-based stream of all (non-soft-deleted) tickets in a project,
+     * ordered by id ascending. Used by {@code CsvExportService} to write
+     * the export response without buffering the full result set in memory
+     * (spec 10 §4 — Session 11 D6).
+     *
+     * <p>The {@link Stream} <b>MUST</b> be consumed inside the same
+     * {@code @Transactional} as the call and closed (try-with-resources)
+     * — Hibernate keeps the JDBC cursor open for the duration of the
+     * stream, and Spring releases the underlying connection only when
+     * either the stream is closed or the transaction commits. The
+     * {@code FETCH_SIZE} hint asks JDBC to fetch in batches rather than
+     * pulling the whole result set up-front (effective on PostgreSQL when
+     * autocommit is off — which it always is inside a Spring transaction).
+     */
+    @QueryHints(@QueryHint(name = "org.hibernate.fetchSize", value = "256"))
+    @Query("SELECT t FROM Ticket t WHERE t.projectId = :projectId ORDER BY t.id ASC")
+    Stream<Ticket> streamByProjectIdOrderByIdAsc(@Param("projectId") Long projectId);
 }

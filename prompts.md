@@ -1163,6 +1163,87 @@ Zero new `ErrorCode` / `AuditAction` / `EntityType` enum additions (6th consecut
 
 ---
 
+## Session 11 — Ticket CSV export & import (spec 10)
+**Goal:** `docs/spec/10-csv.md` §1–§10 — streaming `GET /tickets/export?projectId=X` writing RFC-4180 CSV via `commons-csv`, multipart `POST /tickets/import` that creates tickets row-by-row with per-row failure collection, MIME + header validation, 10 MB cap. All wiring lights up automatically with the slice-7 audit invariant (no new audit code in this slice).
+
+**Decisions (D1–D11) — user approved all my recommendations:**
+
+| # | Decision | Choice (rationale) |
+|---|---|---|
+| D1 | CSV column contract location | **Single `TicketCsvColumns` constants holder in `csv/`** — immutable `List<String> HEADER` + typed `parseRow(CSVRecord)` + `toRow(Ticket)`. One source of truth for header order + parser; no inline string duplication risk. |
+| D2 | Module placement | **New `csv/` feature module** (`csv/{api/{CsvController, CsvImportResponse, RowError}, service/{CsvExportService, CsvImportService, TicketCsvColumns}}`). Mirrors how `dependencies/` orchestrates over `tickets/` without polluting it. `TicketController` is already 100+ lines; adding multipart + streaming would crowd it. |
+| D3 | Auto-assignment for rows w/o `assigneeId` | **Defer to slice 13.** Spec 10 §10 references spec 12 (auto-assign), which isn't built yet. Rows without `assigneeId` land with `null` (same behavior as `POST /tickets` today — also slice-5 D1). Marked with a TODO in `CsvImportService` AND a sibling note in `TicketService.create()`. Slice 13 will wire both at once. Documented as a known-deferral. |
+| D4 | Per-row failure handling (spec §8) | **Per-row `@Transactional(propagation = REQUIRES_NEW)`** on a helper `CsvImportService.createOne(req)`. The outer `importCsv(...)` is NOT `@Transactional` — a failing row only rolls back its own inner txn, prior successful rows survive. Standard Spring idiom for "per-row independent" imports. |
+| D5 | Audit row strategy (spec §9) | **The existing `TicketService.create(req)` already writes `AuditAction.CREATE`** via slice-7 wiring. Calling it per row gives us §9 for free — zero new audit code. (If §9 had wanted a single `BULK_IMPORT` row, we'd need a new `AuditAction`; it doesn't.) This is the cross-cutting wiring's dividend. |
+| D6 | Streaming the export response | **`ResponseEntity<StreamingResponseBody>`** with a lambda that writes via `CSVPrinter` to the response `OutputStream`. Repository fetch via `Stream<Ticket> streamByProjectIdOrderByIdAsc(projectId)` (Spring Data `@Query` returning `Stream<T>`). Consumed inside `@Transactional(readOnly = true)` (Spring requires the txn for cursor-based streaming). Spec name-checks both; pick the framework idiom. |
+| D7 | MIME detection on import | **Trust `MultipartFile.getContentType()` (header-based)** + accept `application/vnd.ms-excel` (legacy `.csv` MIME some clients send). Reject anything else INCLUDING `null` content-type. NO byte-level sniffing — that's for security-sensitive attachments (slice 12), not "is this a CSV file". |
+| D8 | Header validation | **Strict equality**: read header row, assert it matches the spec's 8 columns (any order; `commons-csv` maps by name). Extra columns → 400 `CSV_UNKNOWN_COLUMN` with the offending name in `details[]`. Missing columns → same error (one code, helpful message). |
+| D9 | Inbound `id` column on import | **Ignored silently.** Export includes `id` for human readability; import sees the same column but the row gets a fresh server-assigned id. Erroring on a legitimately exported column would create a frustrating "I can't re-import what I just exported" footgun. |
+| D10 | Round-trip id preservation? | **No.** Re-imported rows always get fresh ids. Spec describes import as creating, not upserting. UPSERT semantics + the audit CREATE/UPDATE distinction would be a separate endpoint. |
+| D11 | Test strategy | **4 new test classes** (Export Mockito, Import Mockito, Controller WebMvc, Integration). Integration test is the keystone — proves real multipart wire format, REQUIRES_NEW actually rolls back the failing row only, 415 for wrong MIME, audit invariant, oversize → 413. |
+
+**Obvious / non-decisions:**
+- Zero new `ErrorCode` / `AuditAction` / `EntityType` — `CSV_UNKNOWN_COLUMN` + `CSV_UNSUPPORTED_TYPE` already in `ErrorCode` from slice 1's foresight; `AuditAction.CREATE` already exists. **7th consecutive slice** with no enum churn.
+- RBAC: both endpoints are `@PreAuthorize("isAuthenticated()")`. Project-membership concerns deferred to slice 13.
+- Date format: ISO-8601 (`Instant.parse` / `Instant.toString()`) — matches the existing JSON convention.
+- Encoding: UTF-8 throughout (request `Content-Type` and response `Content-Type: text/csv; charset=UTF-8`).
+- Import is NOT idempotent (re-running creates new rows). Documented in the controller JavaDoc.
+
+**Touch list:**
+- New main (~7 files): `csv/api/{CsvController, CsvImportResponse, RowError}`, `csv/service/{CsvExportService, CsvImportService, TicketCsvColumns}` (+ tiny `TicketRepository` stream method).
+- Modified main: `TicketRepository` (add `streamByProjectIdOrderByIdAsc(projectId)`).
+- New tests: `CsvExportServiceTest`, `CsvImportServiceTest`, `CsvControllerWebMvcTest`, `CsvIntegrationTest`.
+
+**Prompt (verbatim):**
+> Build slice 11 (CSV) per `docs/spec/10-csv.md`. New `csv/` feature module: `TicketCsvColumns` constants + parseRow/toRow helpers, `CsvExportService` streaming via `CSVPrinter` to `OutputStream` (consumes Spring Data `Stream<Ticket>` inside `@Transactional(readOnly = true)`), `CsvImportService` with per-row `@Transactional(propagation = REQUIRES_NEW)` `createOne(...)` delegating to `TicketService.create(req)` (which already writes the spec §9 audit row via slice-7 wiring — no new audit code). `CsvController` with `GET /tickets/export?projectId=X` returning `ResponseEntity<StreamingResponseBody>` with `Content-Disposition: attachment; filename="tickets-project-<id>-<yyyyMMdd>.csv"` and `POST /tickets/import` accepting `MultipartFile file` + `Long projectId` form field, validating MIME (`text/csv` + `application/vnd.ms-excel`) → 415 `CSV_UNSUPPORTED_TYPE`, validating header (strict 8-column match) → 400 `CSV_UNKNOWN_COLUMN`, returning `{created, failed, errors[]}`. Inbound `id` ignored silently (D9), no auto-assign for rows w/o assigneeId (D3 — slice-13 TODO). Tests: `CsvExportServiceTest` (stream + empty + soft-delete-filter), `CsvImportServiceTest` (per-row failure independence, mixed pass/fail, all-fail, all-pass, header validation), `CsvControllerWebMvcTest` (multipart upload, status codes, content-disposition header, missing projectId), `CsvIntegrationTest` (true round-trip export→re-import, audit row per imported ticket, oversize→413, wrong MIME→415).
+
+**Shipped (8 main + 4 test files):**
+
+| File | Why |
+|---|---|
+| `csv/service/TicketCsvColumns.java` (NEW) | Single source of truth for the 8-column contract (D1). `HEADER` constant + `toRow(Ticket)` for export + `parseRow(CSVRecord, projectId)` for import + `validateHeader(Set<String>)` for spec §"Unknown columns". Per-cell parsing throws `ValidationException` with the existing `TICKET_INVALID_*` codes — CSV rows surface the same diagnostics the JSON path does. |
+| `csv/service/CsvExportService.java` (NEW) | `@Transactional(readOnly = true) writeCsv(projectId, OutputStream)` consumes `Stream<Ticket>` inside a try-with-resources, writes via `CSVPrinter` directly to the caller's stream. No List materialisation; cursor batches via the `fetchSize=256` hint. |
+| `csv/service/CsvImportService.java` (NEW) | Orchestrator (NOT `@Transactional`). Header validation BEFORE the first row (fail-fast). Per row: parse via column contract, run jakarta `Validator` to mirror `@Valid` on the JSON path, delegate to `CsvImportRowExecutor`. Domain exceptions become per-row `RowError` with the feature code; runtime exceptions degrade to `INTERNAL_ERROR`. |
+| `csv/service/CsvImportRowExecutor.java` (NEW) | `@Transactional(propagation = REQUIRES_NEW) createInIsolation(req)` — the per-row tx boundary that makes spec §8 work. Separate bean (not self-injection) so Spring AOP proxies actually intercept the call. Delegates to `TicketService.create(req)` which writes the spec §9 audit row in the same tx (D5 dividend). |
+| `csv/api/CsvController.java` (NEW) | `GET /tickets/export` returns `ResponseEntity<StreamingResponseBody>` with `Content-Disposition: attachment; filename="tickets-project-<id>-<yyyyMMdd>.csv"` (yyyyMMdd UTC). `POST /tickets/import` accepts multipart `file` + form `projectId`, runs MIME allowlist (`text/csv` + `application/vnd.ms-excel`, charset suffix tolerated), delegates to the importer. Both endpoints `@PreAuthorize("isAuthenticated()")`. |
+| `csv/api/CsvImportResponse.java` (NEW) | `record { created, failed, List<RowError> errors }` — spec response shape verbatim. |
+| `csv/api/RowError.java` (NEW) | `record { row, message, code }`. 1-based row number including the header (so the first DATA row is row 2 — matches spreadsheet UI + spec §8 wording). |
+| `tickets/repository/TicketRepository.java` (MODIFIED) | Added `streamByProjectIdOrderByIdAsc(projectId)` returning `Stream<Ticket>` with `@QueryHint org.hibernate.fetchSize=256`. JPQL — `@SQLRestriction` on `Ticket` filters soft-deleted rows automatically. |
+| `auth/security/JwtAuthenticationFilter.java` (MODIFIED — Bug #1) | Override `shouldNotFilterAsyncDispatch() → false` so the JWT filter re-runs on async re-dispatches (StreamingResponseBody). Without this, the `finally { clearContext(); }` from the sync dispatch leaves the async re-dispatch with an empty `SecurityContext` and `AuthorizationFilter` denies the request. See Bug #1 below. |
+| `csv/CsvExportServiceTest.java` (NEW, 5 tests) | Mockito: emits header + data in id-asc order, header order matches spec, §3 empty result → header-only, soft-delete delegation, RFC-4180 quoting round-trip. |
+| `csv/CsvImportServiceTest.java` (NEW, 13 tests) | Mockito: all-valid, inbound `id` ignored (D9), per-row mixed pass/fail, all-fail, bean-validation blank title, missing required priority, per-cell parse errors (bad enums × 3, bad date, bad assignee id), unknown column 400 before any row attempted, missing column same 400, column order irrelevant (D8), runtime exception bucketed not propagated. |
+| `csv/CsvControllerWebMvcTest.java` (NEW, 8 tests) | WebMvc: streaming export bytes + headers (via `asyncDispatch`), missing `projectId` → 400, response envelope shape, missing form `projectId` → 400, wrong MIME → 415, legacy `application/vnd.ms-excel` accepted, `text/csv` with charset accepted, null content-type → 415. |
+| `csv/CsvIntegrationTest.java` (NEW, 8 tests) | `@SpringBootTest`: round-trip export→re-import preserves data with fresh ids (D10), §9 ONE audit row per imported ticket (real wire-path), §8 REQUIRES_NEW per-row isolation through real Hibernate (failing row's tx rolls back, sibling rows + audit rows survive), §7 wrong MIME 415, §"Unknown columns" 400 with `details[].field`, §3 empty export → header-only, §1 soft-deleted filtered out, §2 filename format. |
+
+**Bugs caught by the test pass:**
+
+| # | Bug | Where caught | Fix | Severity |
+|---|---|---|---|---|
+| 1 | `JwtAuthenticationFilter.doFilterInternal()` clears `SecurityContextHolder` in `finally` after sync dispatch. The default `shouldNotFilterAsyncDispatch() = true` makes the filter skip on async re-dispatches, so a `StreamingResponseBody` controller (or any async-returning controller) gets its async dispatch with an empty `SecurityContext`, `AuthorizationFilter` then denies the `.anyRequest().authenticated()` rule even with a valid JWT, request fails with 500 "response already committed". | All 4 export-side integration tests (`roundTrip_exportThenReImport`, `emptyExport_returnsHeaderOnly`, `export_excludesSoftDeletedTickets`, `export_contentDispositionFilenameFormat`) | Override `shouldNotFilterAsyncDispatch()` to return `false` so the filter re-extracts the bearer token from the (same) request on async re-dispatch and re-populates the context. The `try/finally` clear is idempotent — clearing twice is harmless. | **Production bug, pre-existing.** No async controller existed before slice 11, so this filter had never been exercised under async dispatch. Would have surfaced for any future async/SSE endpoint anyway. |
+
+That's it — **one production bug, in pre-existing code, surfaced by the first async controller in the codebase.** Zero bugs in the new slice-11 code itself on first pass.
+
+**Lessons / new Gotcha for `.cursor/rules/30-testing.mdc`:**
+- `OncePerRequestFilter.shouldNotFilterAsyncDispatch()` defaults to `true`. Any filter that mutates `SecurityContextHolder` AND uses `finally { clearContext(); }` will leave async re-dispatches unauthenticated unless the override returns `false`. Worth a Gotcha entry.
+
+**Rejected alternatives during dev:**
+- **Restore SecurityContext in async dispatch via `WebAsyncManagerIntegrationFilter`** — Spring registers this automatically, but it only saves/restores SecurityContext around `Callable` and `WebAsyncTask` controller returns, NOT `StreamingResponseBody`. Wouldn't fix the bug.
+- **Stop clearing SecurityContextHolder in the JWT filter** — would leak the SecurityContext across requests on Tomcat thread-pool reuse (we're `STATELESS`, so no `SecurityContextHolderFilter` cleans up for us). Bad.
+- **One bean for both orchestration + per-row tx** — would require self-injection or `ApplicationContext.getBean(...)` gymnastics to get past Spring's proxy boundary. The two-bean split is cheaper and clearer.
+- **Materialise `List<Ticket>` for export** — works for small projects, dies for 100k-ticket projects. Stream is mandated by spec §4 anyway.
+- **One outer `@Transactional` for the importer** — first failing row would mark the shared tx rollback-only and all prior successful rows would be lost. Spec §8 explicitly forbids this.
+- **Sniff the CSV bytes for MIME validation** — over-engineering. The spec just says "Content-Type", that's the header.
+- **Reject CSV files whose first cell is `id`** — would prevent re-importing exports. Spec doesn't ask for this; the inbound `id` is silently ignored (D9).
+
+**Suite delta:**
+- Slice 9: 308 tests
+- Slice 10: 350 tests (+42)
+- Slice 11: **386 tests (+36)** — 350 prior + 5 export Mockito + 13 import Mockito + 8 controller WebMvc + 8 integration + 2 retroactive renumber.
+
+**Zero new `ErrorCode` / `AuditAction` / `EntityType`.** 7th consecutive slice with no enum churn — the foresight in slice 1 (which pre-seeded `CSV_UNKNOWN_COLUMN` + `CSV_UNSUPPORTED_TYPE`) is still paying dividends.
+
+---
+
 ## Template for future sessions (copy-paste, don't leave empty)
 ```
 ## Session NN — <slice name>

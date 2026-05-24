@@ -123,6 +123,31 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         }
     }
 
+    /**
+     * Re-run on async dispatches (Servlet 3+) — needed by slice 11's
+     * {@code StreamingResponseBody} export endpoint and any future
+     * async-returning controllers.
+     *
+     * <p><b>Why this is the right fix:</b> {@link OncePerRequestFilter}'s
+     * default ({@code true}) skips the filter on the async re-dispatch.
+     * Because we run {@link SecurityContextHolder#clearContext()} in the
+     * sync {@code finally} above (we have to — {@code SessionCreationPolicy.STATELESS}
+     * means there's no {@code SecurityContextHolderFilter} to restore it
+     * later), the async re-dispatch arrives with an empty context, and
+     * Spring Security's {@code AuthorizationFilter} denies the request.
+     *
+     * <p>Returning {@code false} makes the filter re-extract the bearer
+     * token from the same request on the async dispatch (the Authorization
+     * header still lives on the request) and re-populate
+     * {@link SecurityContextHolder}. The {@code try/finally} pattern is
+     * idempotent — clearing again at end of the async dispatch is
+     * harmless.
+     */
+    @Override
+    protected boolean shouldNotFilterAsyncDispatch() {
+        return false;
+    }
+
     /** Surfaced as 401 {@code AUTH_TOKEN_INVALID} by the global handler. */
     static final class TokenInvalid extends DomainException {
         TokenInvalid(String message) { super(ErrorCode.AUTH_TOKEN_INVALID, message); }
