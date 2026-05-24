@@ -32,6 +32,78 @@ Candidates are expected to design and implement the above APIs, adhering to REST
 
 ---
 
+## Submission (this implementation)
+
+This repository is **Ahmad Massalha's implementation** of the assignment above. Every endpoint in the [APIs](#apis) section below is implemented, tested, and live in `main`. Model used to assist with development: **Claude Opus 4.7** (Cursor — Ask mode for design, Agent mode for implementation). See `prompts.md` for the full collaboration log.
+
+### Quick start (3 commands)
+
+```bash
+docker compose up -d            # PostgreSQL 16 on localhost:5432
+./mvnw spring-boot:run          # API on http://localhost:8080
+open http://localhost:8080/swagger-ui.html
+```
+
+Default login: `admin` / `admin` (seeded on first boot; disable via `app.seed.admin.enabled=false`).
+
+### Run the tests
+
+```bash
+./mvnw test
+```
+
+Expect `Tests run: 462, Failures: 0, Errors: 0, Skipped: 0` in ~25–30 seconds. The suite is hermetic — H2 in PostgreSQL-compatibility mode, no Docker required for tests.
+
+### Where to read what
+
+| File / folder | What it is |
+|---|---|
+| **`run.md`** | **Full step-by-step run guide** — prerequisites, DB setup, build, Swagger walkthrough, curl smoke test, configuration reference, troubleshooting. Read this first if anything in the Quick Start above fails. |
+| `prompts.md` | The complete AI collaboration log — 15 sessions, every decision recorded with rationale + rejected alternatives, the slice-by-slice retrospective, and a top-of-file "How this collaboration actually worked" disclosure. |
+| `AGENTS.md` | Working agreement any AI agent (Cursor / Codex / Copilot / Claude Code) reads on entry to this repo. Documents the project's conventions and skill index. |
+| `docs/spec/*.md` | Per-feature acceptance criteria (13 files), derived from the PDF + the API table below. Each spec is the contract a slice was built against. |
+| `docs/decisions/*.md` | ADRs for the 7 non-local design decisions (optimistic locking, soft-delete cascade, token deny-list, stack choice, RBAC on `/users`, RBAC on `/projects`, project-membership semantics for auto-assign). |
+| `docs/plan.md` | The 14-slice build order with Definition-of-Done per slice. |
+| `.cursor/rules/*.mdc` | Always-on conventions Cursor (and other agents) load every turn: project context, Java style, API contract, testing. The `30-testing.mdc` Gotchas list has 22 hard-won lessons. |
+| `.cursor/skills/*` | Four on-demand playbooks: `add-slice`, `add-audit-event`, `add-fsm-transition`, `run-tests-locally`. Each captures a workflow we executed repeatedly. |
+
+### Implementation summary
+
+- **Stack:** Java 21 + Spring Boot 3.4 + Spring Data JPA (Hibernate 6) + Spring Security + PostgreSQL 16. Test layer uses H2 in PostgreSQL-compatibility mode for hermetic CI.
+- **Auth:** HS256 JWT (1h expiry) with an in-memory `jti` deny-list for `/auth/logout`. `@PreAuthorize("hasRole('ADMIN')")` on the ADMIN-scoped endpoints.
+- **Concurrency:** JPA `@Version` optimistic locking on `Ticket` + `Comment`; conflicts surface as HTTP 409 with feature-specific error codes (`TICKET_VERSION_CONFLICT`, `COMMENT_VERSION_CONFLICT`).
+- **Soft delete:** Hibernate `@SQLDelete` + `@SQLRestriction` on `Ticket` + `Project`; ADMIN-only `/restore` + `/deleted` endpoints per PDF §3.5. No cascade from project → tickets (ADR 0002).
+- **Audit log:** Every state-changing action writes a row in the same transaction as the change (`USER` actor for human-triggered, `SYSTEM` for `AUTO_ASSIGN` / `AUTO_ESCALATE` / seeder). `GET /audit-logs` is ADMIN-only with dynamic filters.
+- **Auto-assignment & escalation:** `AutoAssigner` picks the lowest-loaded DEVELOPER on `POST /tickets` when `assigneeId` is absent; `EscalationScheduler` runs every 5 minutes (fixed-delay) bumping priority on overdue tickets until CRITICAL, then flipping `is_overdue=true` (idempotent thereafter).
+- **Testing:** 462 tests across 4 layers — `@DataJpaTest` (repository), Mockito (service), `@WebMvcTest` (controller), `@SpringBootTest` (integration with real H2 + login + audit assertions).
+
+### Compliance with PDF requirements
+
+Every numbered functional + extended requirement in `TDP_issueflow_requirements.pdf` is implemented:
+
+| PDF § | Topic | Coverage |
+|---|---|---|
+| 2.1 | Users CRUD | ✅ |
+| 2.2 | Auth (JWT login / logout / me) | ✅ |
+| 2.3 | Projects CRUD | ✅ |
+| 2.4 | Tickets CRUD + FSM (TODO → IN_PROGRESS → IN_REVIEW → DONE forward-only) + DONE-immutable + optimistic locking | ✅ |
+| 2.5 | Comments CRUD + optimistic locking | ✅ |
+| 3.1 | Audit log (all state-changing actions, USER + SYSTEM actors, filterable endpoint) | ✅ |
+| 3.2 | Ticket dependencies + DONE-blocker guard + cycle detection (added; PDF silent but required to avoid permanent deadlock — see ADR-worthy note in `docs/spec/07-dependencies.md`) | ✅ |
+| 3.3 | Attachments (10 MB cap, MIME allowlist + magic-byte sniff) | ✅ |
+| 3.4 | CSV export + import (`{created, failed, errors[]}`) | ✅ |
+| 3.5 | Soft delete + restore (ADMIN-only) | ✅ |
+| 3.6 | `@mention` mechanism + case-insensitive + `mentionedUsers[]` in comment response + re-evaluate on update | ✅ |
+| 3.7 | Auto-escalation (priority bump on overdue, `is_overdue` flag, manual PATCH resets cycle, idempotent at CRITICAL) | ✅ |
+| 3.8 | Auto-assignment by workload (lowest open-count DEVELOPER, registration-order tie-break, AUTO_ASSIGN/SYSTEM audit row, `/projects/{id}/workload` endpoint) | ✅ |
+| 4.1 | Input validation + informative errors (`ApiError` envelope with `code`, `message`, `path`, `details[]`) | ✅ |
+| 4.2 | PostgreSQL via `compose.yml` + JPA/Hibernate | ✅ |
+| 4.3 | Tests (462, four-layer pyramid) | ✅ |
+| 4.4 | `run.md` with install / DB / build / run / test steps | ✅ |
+| 4.5 | `prompts.md` (model stated) + `AGENTS.md` + `.cursor/rules/` (instruction files) + `.cursor/skills/` (skills) | ✅ |
+
+---
+
 ## APIs
 
 ### Users APIs

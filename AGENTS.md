@@ -18,6 +18,19 @@ This file is read by any AI coding agent working in this repository (Cursor, Cod
 5. **Never add dependencies silently.** If a new Maven artifact is needed, propose it in chat with a one-line justification; wait for approval before editing `pom.xml`.
 6. **Run after editing.** After any non-trivial edit, run `./mvnw -q test` and report results.
 
+## Skills (`.cursor/skills/`)
+
+Four project-scoped skills encode the playbooks we used repeatedly. Future agents (Cursor, Codex, etc.) auto-discover them via the YAML frontmatter:
+
+| Skill | When to invoke |
+|-------|----------------|
+| `add-slice` | Implementing a new vertical feature end-to-end (entity → controller → tests) following the spec-driven workflow used 15 times. |
+| `add-audit-event` | Wiring any new state-changing action into the audit log (spec 06) — picking the right actor (USER vs SYSTEM) and the right `AuditLogService` overload. |
+| `add-fsm-transition` | Extending `TicketStatus` / `Priority` (or any new state machine), or modifying a transition guard. |
+| `run-tests-locally` | Iterating on the suite — full run, by class, by layer, plus a fault-signature lookup table tied to `.cursor/rules/30-testing.mdc` Gotchas. |
+
+Each `SKILL.md` is self-contained, under 200 lines, and references back to specs / rules / past slices for deeper context (progressive disclosure).
+
 ## Conventions (also enforced by `.cursor/rules/`)
 - Feature-package layout under `com.att.tdp.issueflow.<feature>` (`user`, `auth`, `project`, `ticket`, `comment`, `audit`, `dependency`, `attachment`, `mention`, `csv`, `schedule`, plus `common`, `config`, `security`).
 - DTOs use `jakarta.validation` annotations; controllers rely on `@Valid` + global `@RestControllerAdvice`.

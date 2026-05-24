@@ -10,11 +10,13 @@ import jakarta.persistence.Id;
 import jakarta.persistence.Index;
 import jakarta.persistence.Lob;
 import jakarta.persistence.Table;
+import java.sql.Types;
 import java.time.Instant;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.JdbcTypeCode;
 
 /**
  * Ticket attachment — stores the binary payload + metadata in one row
@@ -102,9 +104,24 @@ public class Attachment {
      * PG-mode accepts it as the canonical PG alias. Setting it
      * explicitly makes the DDL portable across both, with no test-only
      * shim required.
+     *
+     * <p><b>Why {@code @JdbcTypeCode(Types.VARBINARY)}:</b> {@code @Lob}
+     * tells Hibernate to use the JDBC {@code BLOB} type code for runtime
+     * parameter binding. The PostgreSQL JDBC driver maps {@code BLOB} to
+     * the "Large Object" facility (a bigint OID pointing to a row in
+     * {@code pg_largeobject}) — which mismatches a {@code BYTEA} column
+     * and surfaces at runtime as
+     * {@code ERROR: column "data" is of type bytea but expression is of
+     * type bigint}. The DDL fix above is not enough; we also need to
+     * override the runtime JDBC type. {@code VARBINARY} binds the array
+     * inline as raw bytes, which is what {@code BYTEA} expects. H2-in-PG-
+     * mode also accepts this; no test-only shim required. Caught by the
+     * post-implementation smoke test against real PostgreSQL — H2
+     * silently accepted both bindings, hiding the mismatch.
      */
     @Lob
     @Basic(fetch = FetchType.LAZY)
+    @JdbcTypeCode(Types.VARBINARY)
     @Column(nullable = false, columnDefinition = "BYTEA")
     private byte[] data;
 

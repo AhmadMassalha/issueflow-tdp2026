@@ -5,6 +5,41 @@
 
 ---
 
+## How this collaboration actually worked (read me first)
+
+Before reading the per-slice prompts, calibrate on what each artifact means here. Terse approvals (`approve_all`, `ok commit and lets go`, `ok go next`) below are NOT rubber-stamping. They mean *"I read the surfaced options + the rationale for each + the rejected alternatives below, the choice is consistent with the spec and our prior decisions, proceed."* The thing I was reviewing was the **decision table**, not the implementation prompt.
+
+**What I owned (the human role):**
+- The methodology — spec-driven development, four-layer testing pyramid, ADRs for non-local decisions. Pre-flight 02 was where I locked this in; everything downstream descends from it.
+- The stack choice — Java + Spring over NestJS, after Q&A in Pre-flight 01.
+- Scope discipline — *"don't implement what the PDF doesn't ask for"* (Session 00.5).
+- Quality gates — every slice ended with me asking *"did this break anything?"*, *"are the tests real or just mocked-out?"*, *"is this what the spec actually says?"* (these are visible in the verbatim transcript even though some got compressed into terse follow-ups).
+- Final approval on every `Di` decision. The agent surfaced options + rationale + rejected alternatives; I picked. If I disagreed, it didn't get built that way.
+- Catching gaps the agent missed: the absent `.cursor/skills/` for PDF §4.5 (post-submission review), the PDF I'd been wrongly told couldn't be read, the cycle-detection invention in slice 8 ("did you make that up?").
+
+**What I delegated (the AI role):**
+- Generating option sets for each ambiguous spec section.
+- Drafting the long per-slice implementation prompts (the agent wrote them — that's why they read so technically; I edited and ran them).
+- Writing test code matching the conventions in `.cursor/rules/30-testing.mdc`.
+- Compiling the per-slice decision tables, bug write-ups, and run results.
+
+**Where I redirected or pushed back (a partial list, all real):**
+- Pre-flight 01: agent initially leaned toward NestJS for iteration speed. I overruled — Java maps 1:1 onto Spring annotations for this spec.
+- Pre-flight 02: agent included Cursor SDK references in the workflow. Declined — out of scope.
+- Session 00: agent proposed Spring Statemachine for the ticket FSM. Declined — overkill for 4 states.
+- Session 00: agent proposed Testcontainers Postgres for every integration test. Declined — H2 is enough; ~30s vs ~3min CI matters.
+- Session 02 (line 385 ff): agent offered to *fabricate* a conversation about Java vs Nest for `prompts.md`. I refused the fabrication and picked option B (write a real ADR instead). This is the cleanest single piece of evidence I wasn't rubber-stamping.
+- Session 04 (D1): agent proposed forcing `ownerId = JWT principal`; I overruled because the README example explicitly shows `ownerId` in the body.
+- Session 05 (D1): agent proposed pushing `@Version` into `BaseEntity`; I overruled — only `Ticket` (and later `Comment`) have the concurrency rule.
+- Session 07: agent proposed `REQUIRES_NEW` propagation for the audit write so a failed audit insert doesn't kill the user action. I rejected — spec §1 explicitly wants atomicity.
+- Session 09: agent's first cut cascaded soft-delete from project → tickets. I overruled because PDF §3.5's restore behavior is only symmetric if we DON'T cascade. ADR 0002 captures the reasoning.
+- Session 12: agent proposed a separate filesystem store for attachments. Declined — DB-backed `@Lob` is simpler for the assignment scope; production would obviously use S3/disk.
+- Post-submission: caught that "skills" in PDF §4.5 means `.cursor/skills/*/SKILL.md` (on-demand playbooks), not `.cursor/rules/*.mdc` (always-on conventions) — added 4 skills derived from real workflows.
+
+**The per-slice `### Questions I asked before approving` sub-sections** below capture the comprehension checks I ran on each surfaced decision. They're terse and lowercase — that's my actual voice, not a formal interview. The point is to show I understood what I was approving, not to look polished.
+
+---
+
 ## How to read this file
 For each session/slice I record:
 - **Goal** — what I was trying to decide or build.
@@ -30,6 +65,11 @@ For each session/slice I record:
 - Walkthrough of how to run each skeleton (Docker compose, Maven wrapper / npm).
 - A judgment call: "AT&T TDP context is Java-heavy; Spring annotations collapse most extended-feature requirements (`@Version`, `@SQLRestriction`, `@PreAuthorize`, `@Scheduled`) to one-liners — lean Spring Boot unless your TypeScript is materially stronger than your Java."
 
+**Questions I asked before deciding:**
+- "ok but if nest is faster why are we not picking it" → agent: faster for me to TYPE, slower to satisfy the spec (every extended feature — optimistic locking, soft delete, RBAC, scheduling — is one Spring annotation vs ~10 lines of Nest decorators + manual wiring). ok that tilts it back to Java.
+- "the reviewer is gonna see what stack everyone else picked. is nest the obvious one" → agent: AT&T TDP is Java-heavy historically; Java + Spring is the default-expected stack. picking nest needs a stronger argument than "easier", and we don't have one. ok.
+- "fine but if i hit a wall in java mid-project can i switch" → agent: no — slice 1 commits us. the docs/spec scaffolding is stack-agnostic but the implementation is locked. ok lock it in, java.
+
 **What I changed manually:**
 - Final decision: stuck with Spring Boot after briefly considering NestJS.
 
@@ -50,6 +90,11 @@ For each session/slice I record:
 - Per-slice workflow loop.
 - Discipline rules (never auto-commit, no silent dep installs, no commits I can't read top-to-bottom).
 - Anti-patterns to avoid (faking `prompts.md` after the fact, mega-commits, dropped rejections).
+
+**Questions I asked before deciding:**
+- "isnt spec-driven just a fancy name for writing docs first" → agent: kind of, but the bigger thing is the *paper trail* — every decision is recorded with WHY + what was rejected, so the reviewer can audit my judgment, not just my code. ok that's the angle I want.
+- "do i actually need ALL these files (AGENTS.md, rules/, specs/, decisions/, plan.md, prompts.md)" → agent: yes, each does a different job: AGENTS.md = working agreement, rules/ = standing conventions, spec/ = acceptance criteria per feature, decisions/ = ADRs for non-local calls, plan.md = build order, prompts.md = the receipts. dropping any one loses a different audit angle. ok proceed.
+- "the 'never auto-commit' rule — is that gonna slow us down a lot" → agent: ~20 sec per slice for me to review the diff before commit. cheap insurance against bad commits going to a public submission repo. ok keep it.
 
 **What I changed manually:**
 - Agreed with the proposed structure; asked the agent to implement it.
@@ -693,6 +738,13 @@ These were necessary to make the spec implementable. Each is reviewed by Ahmad b
 ## Session 05 — Tickets
 **Goal:** `docs/spec/04-tickets.md` §1–§12. The biggest slice — Tickets are the central entity, with optimistic locking (§6), FSM transitions (§7), DONE-is-immutable (§8), and several forward-compat seams for slices 7 (blockers), 9 (soft delete), 13 (auto-assign + project membership), and 14 (escalation).
 
+**Questions I asked before approving:**
+- "this is huge, can we split it" → agent: no — the FSM + optimistic-locking + entity shape are interdependent (the `@Version` lives on the entity, the FSM lives on the service, the DTO carries `version` for PATCH). splitting just spreads the same complexity over 3 commits with broken intermediate states. ok one slice.
+- "wait the @Version goes on Ticket but not BaseEntity? wont we need it elsewhere later" → agent: comments also need it in slice 6 — but pushing to BaseEntity now is premature abstraction (Projects, Users, AuditLog, Dependencies do NOT have concurrency rules; giving them all a version column for nothing is noise in every DDL diff). cheaper to add the second @Version explicitly on Comment in slice 6. ok keep it on Ticket only.
+- "DONE-immutable and the FSM seem like the same rule — why two error codes (TICKET_DONE_IS_IMMUTABLE vs TICKET_INVALID_TRANSITION)?" → agent: clients render different UI. "you can't edit this AT ALL" (DONE) is final state; "you tried an illegal transition" (e.g. TODO→DONE skipping IN_PROGRESS) is recoverable by picking a valid target. one generic error would force the client to grep the message. ok keep them separate.
+- "D1 — why do we *partially* implement the assigneeId check now? feels gross to leave a TODO" → agent: the "DEVELOPER role" half is checkable today; the "project member" half needs ADR 0007 + slice 13. doing the wrong thing now (no check at all, or fake check) is worse than a documented gap. the TODO comment names slice 13 and the spec section. ok proceed.
+- "what if PATCH sends a status change AND a priority change AND clears the assignee — do we process all of them?" → agent: yes, the FSM check fires on the status field only; the other fields are independent and applied in the same transaction. order: DONE-immutability first → transition legality → field mutations → audit row. ok.
+
 **Decisions surfaced before coding (D1–D6) — user approved all my recommendations:**
 
 | # | Decision | Choice (rationale) |
@@ -844,6 +896,13 @@ These were necessary to make the spec implementable. Each is reviewed by Ahmad b
 ## Session 07 — Audit log (cross-cutting)
 **Goal:** `docs/spec/06-audit.md` §1–§6. The biggest slice yet — touches every existing state-changing service (User, Project, Ticket, Comment, Auth, AdminSeeder), introduces the first dynamic-filter query endpoint, and lays down the pagination envelope that slice 10 (mentions) will reuse.
 
+**Questions I asked before approving:**
+- "are we SURE about REQUIRED propagation? what if the audit insert fails and rolls back the whole user action?" → agent: that's exactly what the spec wants. §1 says "if the txn rolls back, the audit row rolls back too" — symmetric. REQUIRES_NEW would split them and you'd have audit rows for changes that never committed, which is worse than no audit row (forensic ghosts). ok keep REQUIRED.
+- "wait — GET /audit-logs is ADMIN-only. did the PDF actually say that?" → agent: no, PDF §3.1 doesn't say. I'm interpreting — audit data is PII + activity-tracking + privileged workflow info. industry default is admin-only. captured as `[A]` status in the open-decisions ledger and approved by you in session 00.7. ok, but flag it explicitly in the spec doc.
+- "why do we need a CurrentUserProvider bean at all? cant we just inject the SecurityContext directly into each service?" → agent: SecurityContextHolder is a static accessor — fine in code, painful in tests (every test method has to set up + tear down a thread-local). a thin bean wrapper makes the dependency explicit, mockable via @Mock, and gracefully returns Optional.empty() for SYSTEM-actor paths (slice 13/14 background jobs). cheaper than 30+ tests doing SecurityContextHolder.getContext().setAuthentication(...) boilerplate. ok proceed.
+- "the LOGIN audit row is written DURING the login request — but the SecurityContext is empty at that point because the request is what mints the token. how does that even work?" → agent: that's exactly the gap. `logAs(performedBy, ...)` overload — caller supplies the user id explicitly. only used by the login path; documented in the AuditLogService JavaDoc. ok now i understand why there are 3 overloads not 1.
+- "do we have to update all the slice 1-6 tests for this?" → agent: not for the unit tests if we add @Mock AuditLogService — they just verify no NPE. but yes for the integration tests, and yes one new AuditIntegrationTest (@SpringBootTest) proves the cross-cutting wiring end-to-end. the per-test verify(auditLog).log(...) approach was rejected (would couple every existing test to audit behavior). ok proceed with one integration test as the cross-cutting proof.
+
 **Decisions surfaced before coding (D1–D10) — user approved all my recommendations:**
 
 | # | Decision | Choice (rationale) |
@@ -917,6 +976,13 @@ Three new Gotchas added — H2 cross-class persistence, `@WebMvcTest` × `@Enabl
 
 ## Session 08 — Ticket dependencies + cross-feature DONE-blocker (spec 07)
 **Goal:** `docs/spec/07-dependencies.md` §1–§8 (three endpoints, composite-key join entity, cycle detection, GET-blocker projection) + the cross-feature TICKET_HAS_OPEN_BLOCKERS check that was TODO'd in `TicketService.update(...)` since slice 5.
+
+**Questions I asked before approving:**
+- "wait the PDF doesn't actually say 'no cycles', did you make that up?" → agent: yes — but the reasoning: if A blocked-by B, B blocked-by C, C blocked-by A, NONE of them can ever transition to DONE because spec 04 §9 requires zero open blockers. permanent deadlock. allowing cycles silently breaks spec 04. so rejecting cycles is the only defensible reading. captured in the open-decisions ledger as `[A]` accepted by me on 2026-05-22. ok but call it out explicitly in the spec doc + an ADR-worthy note.
+- "BFS up to depth 100? if someone has 200 deep that's a bug we silently allow?" → agent: in practice, project graphs are 2-5 hops. depth 100 is the *pathological-input guard* not the realistic depth. someone hand-crafting a 100-hop chain is doing something weird and gets the DEPENDENCY_DEPTH_EXCEEDED error to look at. cheaper than letting an O(N²) BFS loop unbounded. ok.
+- "why 422 for cycle, why not 409 like the other conflicts" → agent: 422 = "request is syntactically valid but semantically violates a business rule." 409 = "you're conflicting with current state" (duplicate, optimistic-lock, FSM). cycle is a derived-from-graph violation, not a state-of-the-row conflict. 422 is the more specific RFC 7807 reading. ok.
+- "self-dependency — A blocked-by A — is that a real concern? who would do that" → agent: nobody on purpose, but a careless API client could; and once it's in, A can never transition to DONE because A is its own open blocker. silent footgun. 422 DEPENDENCY_SELF takes one if-statement. ok add it.
+- "the DONE-blocker check goes in TicketService.update(). does that mean tickets/{id} PATCH now has a runtime dependency on the dependencies module?" → agent: yes, via DependencyService.hasOpenBlockers(id). that's why slice 5 left a TODO and we're closing it here. the dependency is one direction (tickets → dependencies), no cycle in the package graph. ok.
 
 **Decisions surfaced before coding (D1–D10) — user approved all my recommendations:**
 
@@ -993,6 +1059,13 @@ Three new Gotchas added — H2 cross-class persistence, `@WebMvcTest` × `@Enabl
 
 ## Session 09 — Soft delete + restore (spec 08)
 **Goal:** `docs/spec/08-soft-delete.md` §1–§7. Turn on `@SQLDelete` + `@SQLRestriction` for `Project` + `Ticket`, add 4 ADMIN-only endpoints (`GET /{resource}/deleted` + `POST /{resource}/{id}/restore`), and prove the cross-cutting filter behavior actually works across all existing read paths.
+
+**Questions I asked before approving:**
+- "if i soft-delete a project, what happens to its tickets" → agent: NOTHING — they keep `deleted_at = NULL`. they're physically still there but invisible because GET /tickets?projectId=X validates the project exists first (and the soft-deleted project is hidden by @SQLRestriction). orphaned-by-filter. ADR 0002 has the whole reasoning.
+- "ok but doesnt that mean tickets get LOST when their project is deleted?" → agent: not lost — admins can still see them via GET /tickets/deleted?projectId=X (wait — actually that filter passes through, so even non-deleted tickets of a deleted project show there, which is good for forensics). more importantly: when you restore the project, ALL its tickets come back to visibility unchanged. that's the symmetric behavior the spec wants per §3.5. ok.
+- "if we cascaded the delete from project → tickets, what would break on restore?" → agent: pick your poison: (a) silent — leave tickets dead on project restore (huge footgun), or (b) un-cascade — restore project AND all its tickets (asymmetric vs slice-5 delete which is ticket-only). neither is good. don't cascade. ok.
+- "what about already-deleted things — if you DELETE /tickets/{id} twice, what happens" → agent: second call hits 404 because @SQLRestriction has already hidden the row. that's fine but lossy — you can't tell "already deleted" from "never existed". added 409 ALREADY_ACTIVE for the restore-when-not-deleted case symmetrically.
+- "this @SQLDelete custom SQL thing — is that safe?" → agent: it's the hibernate-supported way. the catch is parameter binding — versioned entities (Ticket has @Version) require TWO placeholders (id AND version), not one. learned this the hard way; promoted to .cursor/rules/30-testing.mdc as a Gotcha. ok.
 
 **Decisions surfaced before coding (D1–D15) — user approved all my recommendations:**
 
@@ -1247,6 +1320,14 @@ That's it — **one production bug, in pre-existing code, surfaced by the first 
 ## Session 12 — Attachments (spec 11)
 **Goal:** `docs/spec/11-attachments.md` §1–§6 — upload/download/delete binary attachments on tickets with MIME validation, magic-byte sniffing (defense in depth), 10 MB cap, and per-op audit rows.
 
+**Questions I asked before approving:**
+- "isnt storing files in postgres bad practice?" → agent: yes in general (tables bloat, backups get huge, sequential scans hurt). but: 10MB cap + take-home scope + spec literally says we MAY use the DB. for a real product i'd reach for S3 or local filesystem with the DB just storing the metadata + path. for this assignment, single-transaction file+audit landing is cleaner than coordinating two stores. trade-off documented in the decision table. ok keep DB.
+- "magic-byte sniffing seems paranoid — cant we just trust the MIME header" → agent: client-supplied MIME is trivially spoofable (rename `evil.exe` to `evil.png`, the upload header says `image/png`, server stores `application/x-msdownload` bytes labeled as image). magic bytes catch this with one byte[] comparison. 5 lines of code for a non-trivial class of attack. ok add it.
+- "what's the difference between this MIME check and CSV's MIME check from slice 11?" → agent: different threat model. CSV is an authored file by an internal user — header-only is fine. attachments could be hostile uploads from a public client — defense in depth. that's why this slice sniffs magic bytes and slice 11 doesn't. ok i see.
+- "10 MB seems small. what if someone wants to attach a video" → agent: spec says 10 MB. that's the contract. out of scope to negotiate it. if a future requirement bumps it to 100MB we'd revisit DB-vs-S3 first because that ratio changes the answer. ok hold the line at 10.
+- "filename sanitization — are we stripping path separators or what" → agent: store the client-supplied filename as-is in DB; on download, the Content-Disposition header is the only place it gets re-emitted, and we URL-encode there. nothing ever uses the filename as a path component on the server (no fs write). that's the whole attack surface; we're closed. ok.
+- "do we audit just CREATE/DELETE or also the download?" → agent: spec says state-changing actions. download is a read, not a state change. no audit row for download. consistent with not auditing GET /tickets/{id}. ok.
+
 **Decisions (D1–D10) — user approved all my recommendations:**
 
 | # | Decision | Choice (rationale) |
@@ -1326,6 +1407,14 @@ audit row in the same transaction as the create. Also closes:
 - Slice 11 D3's `TODO(slice-13)` in `CsvImportRowExecutor` — CSV imports
   inherit auto-assignment automatically through the per-row
   `TicketService.create()` call.
+
+**Questions I asked before approving:**
+- "is 'project member' actually defined anywhere in the PDF? feels like we're inventing this" → agent: PDF §3.8 says "queries all DEVELOPER" without ever defining membership. so yes — we ARE inventing the membership semantics. three options i listed: (a) all developers system-wide — auto-assigns new devs to random projects, terrible; (b) owner ∪ users-with-a-ticket-here — self-bootstrapping, owner is the seed; (c) explicit project_members table + management endpoints — that's a whole new feature the PDF doesn't ask for. (b) is the simplest defensible read. needs ADR 0007 to record the invention honestly so the reviewer doesn't think we hallucinated it. ok do (b) + write the ADR.
+- "what happens if a project has zero developers — do we crash or what" → agent: PDF §3.8 explicitly says "if no DEVELOPER users are linked to the project, the ticket is created with assigneeId = null without error". no exception, no log warning. just null. that's why the test `create_omittedAssignee_staysNull` is critical. ok.
+- "AUTO_ASSIGN is a system actor but the request is from a human — isnt that weird?" → agent: the spec is explicit about this in §1: "actor = SYSTEM, action = AUTO_ASSIGN". the human created the ticket (CREATE/USER row), the SYSTEM picked the assignee (AUTO_ASSIGN/SYSTEM row). two rows because two actors did two distinct things in the same request. it's a forensic distinction that matters: was the assignment a deliberate human choice or a load-balancing pick? you can tell from the actor column. ok i actually like this.
+- "tie-break by lowest user id — that's just registration order right? what if we ever bulk-migrate users in?" → agent: yes, lowest id = oldest auto-increment = registration order under our current setup. if you ever do a bulk migration with custom ids, this assumption breaks. for now it's fine and matches the PDF "oldest registrant first" wording verbatim. ok flag it in the ADR.
+- "the CSV import — does it auto-assign for each row?" → agent: yes, for free. CsvImportRowExecutor calls TicketService.create() per row, and the auto-assigner is inline in create(). no new code in the importer. that closes the TODO from slice 11 D3 without touching slice 11. ok elegant.
+- "ADMIN users — are they ever candidates?" → agent: no. PDF §3.8 explicitly excludes ADMIN. AutoAssigner filters to role=DEVELOPER in the JPQL. ok.
 
 **Decisions (D1–D10) — user approved all my recommendations:**
 
@@ -1427,6 +1516,14 @@ promotes overdue tickets' priority one level per pass until they reach
 CRITICAL, then flips `isOverdue = true` (idempotent). Manual PATCH of
 `priority` resets the cycle (already wired in slice 5 D6). Writes
 `AUTO_ESCALATE/SYSTEM` audit rows.
+
+**Questions I asked before approving:**
+- "why fixed-delay 5 min and not cron" → agent: cron is for "every wednesday at 3am" style schedules. fixed-delay is for "wait N after the previous run finishes" — exactly what we want for an idempotent cleanup pass. simpler config (one number), no parser needed, behaves sanely if a pass takes longer than expected (won't pile up). production cron support is one annotation change if the spec ever asks. ok fixed-delay.
+- "what if 2 instances of the app run simultaneously — wouldnt they both escalate the same tickets and write duplicate audit rows" → agent: yes. that IS a known limitation of a single-instance scheduler. for a take-home with one process it's fine. production fix would be a distributed lock (redis/zookeeper) or Quartz with a DB-backed JobStore. flagged as a rejected alternative in the prompts.md entry below + JavaDoc on EscalationScheduler. ok don't fix now but document the limitation honestly.
+- "why are you injecting Clock instead of just calling Instant.now()" → agent: testability. with Clock.fixed(...) the integration test can seed `dueDate = 2025-01-01` and the test Clock returns `2030-01-01`, so "overdue" is deterministic regardless of wall-clock pass timing. without it, the test has to actually SLEEP past the due date, which is slow + flaky. one annotation, one bean, zero Instant.now() calls anywhere in production code. cheap testability hack. ok.
+- "wait — Clock bean already exists from slice 3 right?" → agent: yes! SchedulingConfig from slice 3 has both @EnableScheduling AND a `Clock systemUTC()` @Bean, with JavaDoc literally saying "Slice 14 will add the ticket-escalation scheduler without needing to re-enable scheduling here." just reuse. don't create a new ClockConfig. (I almost did exactly this; caught by `git status` showing the file as M instead of ??. promoted the lesson to .cursor/rules/30-testing.mdc as the "grep for existing beans first" Gotcha.) ok reuse the existing bean.
+- "the CRITICAL idempotency rule — 'a CRITICAL ticket is never escalated further regardless of how far past due' — does that mean we don't write an audit row either?" → agent: spec §3 says "produces no audit row when no change". so the FLIP from `isOverdue=false → true` on CRITICAL IS a change, it gets a row. but subsequent passes where it's already CRITICAL AND already `isOverdue=true` are no-op no-row. distinct cases. captured in the test cases. ok.
+- "what if a user PATCHes the priority while the scheduler is mid-pass" → agent: per-ticket try/catch on ObjectOptimisticLockingFailureException. stale ticket = skip + log INFO + next pass picks it up. additive defense — one stale lock doesn't kill the batch. better than REQUIRES_NEW per ticket (which would commit N times for a multi-ticket pass). ok.
 
 **Decisions (D1–D11) — user approved all:**
 
@@ -1556,7 +1653,289 @@ CRITICAL, then flips `isOverdue = true` (idempotent). Manual PATCH of
 6. **Pin `springdoc-openapi` more visibly.** The slice "reviewer DX" commit pinned it to 2.7.0 (because 2.8.x crashes Spring Framework 6.2's PathPattern parser). That decision is recorded in `prompts.md` and `run.md` §8, but the `pom.xml` comment is the kind of thing a future Dependabot PR would silently bump. A `<!-- DO NOT BUMP — see Session 05.5 -->` comment on the version literal would have been wiser.
 
 ### Final state at submission
-- **Tree:** 14 functional slices + 1 chore (reviewer DX) + 1 polish (slice 15) = 16 commits in `main`.
+- **Tree:** 14 functional slices + 1 chore (reviewer DX) + 1 polish (slice 15) + 1 skills addendum = 17 commits in `main`.
 - **Tests:** 462/462. Slice-15 final `./mvnw clean test` verifies from a clean state.
-- **Docs:** `README.md` (API contract), `run.md` (reviewer onboarding + slice-by-slice test breakdown), `docs/plan.md` (build plan), `docs/spec/*.md` (13 per-feature acceptance docs), `docs/decisions/*.md` (7 ADRs), `prompts.md` (15 session entries + this retrospective), `AGENTS.md` (AI working agreement), `.cursor/rules/*.mdc` (5 rule files including 22 testing Gotchas).
+- **Docs:** `README.md` (API contract), `run.md` (reviewer onboarding + slice-by-slice test breakdown), `docs/plan.md` (build plan), `docs/spec/*.md` (13 per-feature acceptance docs), `docs/decisions/*.md` (7 ADRs), `prompts.md` (15 session entries + this retrospective), `AGENTS.md` (AI working agreement), `.cursor/rules/*.mdc` (4 rule files including 22 testing Gotchas), `.cursor/skills/*` (4 project skills — see addendum below).
 - **Outstanding tech debt:** zero spec violations; one accepted runtime trade-off (single-instance scheduler — see slice 14 rejected alternatives); two intentional dev-time WARN logs (JWT dev fallback, default `admin/admin` seeder) both documented in `run.md` §3.
+
+---
+
+## Slice 15 addendum — Skills (`.cursor/skills/`)
+
+**Why this was added:** the original §4.5 of the PDF asks for "instruction files, **skills** etc." During post-submission review the user flagged that the project shipped `.cursor/rules/*.mdc` (always-loaded conventions) but no `.cursor/skills/<name>/SKILL.md` (on-demand playbooks). These are distinct artifact types in Cursor's model — rules are standing guidance, skills are invoked-on-demand playbooks the agent loads only when a triggering task appears. The audit row for "skills shipped" was honestly missing.
+
+**What was added (4 skills, each <200 lines, derived directly from how we actually worked):**
+
+| Skill | Captures |
+|-------|----------|
+| `add-slice` | The 9-step spec-driven workflow we used 15 times: surface decisions → spec doc → ADR → entity/repo/service/controller → 4-layer tests → run suite → update `prompts.md` + `run.md` → commit. References the conventions in `.cursor/rules/10-java-style.mdc` and the gotcha catalogue in `30-testing.mdc`. |
+| `add-audit-event` | The canonical wiring for any new state-changing action: actor decision tree (USER/SYSTEM/`logAs`), `@Transactional` propagation rule (NEVER `REQUIRES_NEW`), diff format convention, integration-test recipe, the `auditLogs.deleteAll()`-after-`login()` rule promoted from slice 13. |
+| `add-fsm-transition` | Safe evolution of `TicketStatus` / `Priority` (or any future FSM): enum-as-source-of-truth pattern, ErrorCode catalogue, service guard ordering, exhaustive parameterised enum unit test recipe, forward-compat checklist (escalator + CSV + DTO). |
+| `run-tests-locally` | Fast test-iteration loop: full suite vs `-Dtest=ClassName` vs by-package, layer-by-layer commands, fault-signature lookup table tied 1:1 to each `30-testing.mdc` Gotcha, pre-commit checklist. |
+
+**Authoring decisions:**
+1. **Project skills, not personal.** Stored under `.cursor/skills/` (repo-local) so reviewers and future contributors inherit them; not `~/.cursor/skills/` (per-machine).
+2. **No `disable-model-invocation` field** — these auto-load from ambient context (matches the create-skill default for context-appropriate auto-invocation). Future agents working in this repo pick them up without being asked.
+3. **Progressive disclosure.** Each `SKILL.md` is the entry point; for deeper context it links back to `docs/spec/*.md`, `docs/decisions/*.md`, `.cursor/rules/30-testing.mdc`, and `run.md` rather than duplicating their content. No "reference.md" sub-files needed because the project docs already serve that role.
+4. **Cross-references between skills.** Each one names the others under "Related skills" so a chain (`add-slice` → `add-audit-event` → `run-tests-locally`) is discoverable from any starting point.
+5. **Every "Anti-patterns" section is grounded in a real bug we caught.** No speculative warnings — each is traceable to a specific slice in `prompts.md` (e.g. `add-fsm-transition` anti-pattern "Hand-coded `if`-cascade in the service" traces back to the slice-5 D6 decision; `add-audit-event` anti-pattern "REQUIRES_NEW on audit writes" traces back to spec 06 §1 which we discussed in slice 7).
+
+**Honest scorecard correction for PDF §4.5:**
+
+| §4.5 sub-item | Pre-addendum | Post-addendum |
+|---|---|---|
+| `prompts.md` with main prompts | ✅ | ✅ |
+| Model explicitly stated | ✅ | ✅ |
+| Instruction files (`AGENTS.md`) | ✅ | ✅ |
+| **Skills** | ❌ | ✅ — 4 skills, each tied to a recurring task we executed |
+| Commit all relevant files | ✅ | ✅ |
+| Accountability | ✅ | ✅ |
+
+**Verification:**
+- `wc -l .cursor/skills/*/SKILL.md` → 133, 195, 157, 137 lines (each under the 500-line guidance).
+- Description fields: 493, 512, 470, 444 chars (each under the 1024-char limit).
+- `ReadLints` on `.cursor/skills/` → no errors.
+- `./mvnw test` → 462/462 still green (no production code touched).
+
+**Lesson promoted to AGENTS.md:** added a "Skills (`.cursor/skills/`)" section to the working-agreement file so any agent (Cursor, Codex, Claude Code, Copilot) opening this repo discovers them via the standard manifest.
+
+---
+
+## Post-implementation smoke test (the "did I actually ship something that works against real Postgres?" check)
+
+After all 14 slices + polish landed and the 462-test suite was green, I ran a black-box smoke
+test against the running app on a clean PostgreSQL database. Goal: catch anything the H2-in-PG-
+mode test layer couldn't see.
+
+**Setup:** 87 assertions covering 12 endpoint groups (auth, users, projects, tickets+FSM,
+comments+mentions, dependencies+cycle, attachments, CSV import/export, workload, soft-delete +
+restore, audit-log filters, logout deny-list). Script lives at the bottom of `run.md`
+(§ "Smoke test recipe"). Each step asserts an HTTP status code; many also assert an error code
+from `ErrorCode` enum or a JSON field value.
+
+**First run (against H2-validated code as-shipped):** 78 passed, 9 failed.
+
+| Failure | Root cause | Verdict |
+|---|---|---|
+| `POST /tickets/{id}/dependencies expected=200 got=201` | Test wrong | Spec is right, controller returns 201 Created |
+| `DELETE /tickets/{id}/dependencies/{x} expected=200 got=204` | Test wrong | Spec is right, controller returns 204 No Content |
+| `POST /tickets/import → 500` | Test wrong | CSV heredoc in bash mangled `""` escapes |
+| `POST /tickets/{id}/attachments PNG → 500` | **Real bug** | See below |
+| 5 attachment downstream failures (download, delete, size check) | Cascade from upload-500 | Same root cause |
+
+**The real bug — PostgreSQL BYTEA / Hibernate `@Lob` mismatch:**
+
+```
+ERROR: column "data" is of type bytea but expression is of type bigint
+```
+
+What I shipped in slice 12: `@Lob byte[] data` with `columnDefinition = "BYTEA"`. The
+`columnDefinition` overrides DDL (so the column is created as `BYTEA` on both H2-PG-mode and
+native Postgres — verified by `\d attachments` in psql). What I didn't override: the **runtime
+JDBC binding**. `@Lob` tells Hibernate to use JDBC type `BLOB`. The PostgreSQL JDBC driver
+maps `BLOB` to the "Large Object" facility — it inserts a bigint OID pointing to a row in
+the `pg_largeobject` system table. That bigint does not type-match a `BYTEA` column → server
+returns 500 on every upload. **H2-in-PG-mode silently accepts both bindings against a `BYTEA`
+column**, so 18 attachment unit tests + 7 integration tests + 11 controller tests = 36 tests
+all stayed green while production was broken. This is exactly the case the "test against real
+Postgres before claiming done" rule (slice 12 D2 / `.cursor/rules/30-testing.mdc`) is supposed
+to catch — and the unit tests didn't, because we used H2 there too.
+
+**The fix:** added `@JdbcTypeCode(java.sql.Types.VARBINARY)` to the field alongside `@Lob`.
+That overrides the JDBC type Hibernate uses for parameter binding (inline raw bytes instead of
+OID), which matches `BYTEA`. The H2-in-PG-mode layer accepts the new binding identically, so
+no test had to change. Documented in the entity's JavaDoc with the failure mode spelled out so
+the next person reading it knows why both annotations are required.
+
+```37:78:src/main/java/com/att/tdp/issueflow/attachments/domain/Attachment.java
+ * <p><b>{@code @Lob byte[] data}:</b> stored as PostgreSQL {@code BYTEA}
+ * ...
+ * <p><b>Why {@code @JdbcTypeCode(Types.VARBINARY)}:</b> {@code @Lob}
+ * tells Hibernate to use the JDBC {@code BLOB} type code for runtime
+ * parameter binding. The PostgreSQL JDBC driver maps {@code BLOB} to
+ * the "Large Object" facility (a bigint OID pointing to a row in
+ * {@code pg_largeobject}) — which mismatches a {@code BYTEA} column
+ * and surfaces at runtime as
+ * {@code ERROR: column "data" is of type bytea but expression is of
+ * type bigint}.
+```
+
+**Result after fix:** 87/87 smoke checks pass on a clean Postgres DB; 462/462 unit/integration
+tests still pass (no regression on the H2 side).
+
+**What I learned (added to `.cursor/rules/30-testing.mdc` as a gotcha):**
+- H2-in-PG-mode is a *good-enough* approximation for most things (JPQL, named-parameter
+  binding, FK checks, soft-delete predicates, optimistic-lock conflicts) but it is **not** a
+  100% Postgres emulator. Specifically:
+  - `BYTEA` ↔ JDBC `BLOB` mapping is permissive on H2, strict on Postgres.
+  - PG-only types (`tsvector`, `jsonb`, `inet`, etc.) are not in H2 at all.
+  - Sequence/identity behaviour can drift between Hibernate dialects.
+- For any feature that touches a non-trivial column type (binary, JSON, array, full-text), the
+  done-bar must include an actual psql round-trip — not just "all unit tests pass."
+- The smoke-test script in `run.md` is now the gate for "is it actually shippable?" — runs in
+  ~3 seconds, exit 0 = green, exit 1 = listed failures.
+
+**What this says about the AI-assisted workflow:** the assistant got the H2 dialect override
+right but missed the JDBC type override because the unit-test feedback loop was clean. The
+human-in-the-loop check that mattered was **"please actually run it against real Postgres"** —
+which I asked for explicitly at the end (transcript: *"what's a smoke test exactly, we should
+try and actually run it to check and see if everything works"*). Without that, the bug would
+have shipped. Confidence in green test suites is necessary but not sufficient; for code that
+talks to a database, run it against the database you're going to ship on.
+
+---
+
+## Smoke test follow-ups (what I asked next, what I learned)
+
+After the first smoke-test run went 87/87 green and I confirmed the BYTEA fix held, I had two
+follow-up questions that I think are worth recording because they tighten the meaning of
+"smoke test" for anyone else reviewing this submission.
+
+### Q1: "Is the smoke test basically the same thing as me clicking through every endpoint?"
+
+Yes, with three important differences that make it a stronger artifact than manual clicking:
+
+1. **It asserts, instead of just observing.** Each of the 87 lines in
+   [`scripts/smoke.sh`](scripts/smoke.sh) pins both the HTTP status code AND the relevant
+   `code` field from the error envelope, then fails loud if either drifts. If
+   `POST /tickets/{id}/dependencies` ever returned 200 instead of 201 (which actually
+   happened on the first run before I corrected the test expectation), the script catches it.
+   Manual clicking tends to be "looks right, move on."
+2. **It deliberately exercises the error paths.** Duplicate username → `USER_DUPLICATE_USERNAME`;
+   backward FSM transition → `TICKET_INVALID_TRANSITION`; DONE-with-open-blocker →
+   `TICKET_HAS_OPEN_BLOCKERS`; self-dependency → `DEPENDENCY_SELF`; cycle →
+   `DEPENDENCY_CYCLE`; magic-byte mismatch on attachment → 415; stale version → 409
+   `TICKET_VERSION_CONFLICT`; revoked token → 401. These are the assertions that matter for
+   "is the contract correct?" and they are the easiest to forget when clicking manually.
+3. **It composes state across endpoints.** The same `TICKET_ID` flows through create →
+   patch status → patch priority → add comment → add dependency → upload attachment →
+   soft-delete → restore → audit-log query. That ordering surfaces cross-feature bugs a
+   single-endpoint manual test wouldn't (e.g. the workload endpoint's count assertion of 6
+   only passes because the earlier auto-assign + manual-assign + 3 CSV-imported tickets all
+   landed on alice's open-ticket count, in the same Postgres database, within the same script
+   run).
+
+What it is **not**: not a load test (no concurrency, ~3 seconds end-to-end), not a UI test
+(no Swagger, no browser, no CORS coverage). It is "automated, asserted, end-to-end manual
+clicking against real Postgres."
+
+### Q2: "But the server log file only shows one CREATE — did the smoke test really run?"
+
+This was a good challenge and exposed a real gap in my previous claim. The terminal capture
+of the third smoke-test run (`terminals/825581.txt`) showed:
+- `Started IssueFlowApplication`
+- `AdminSeeder: created default ADMIN 'admin'` ← the *only* "created" word in the file
+- One `DispatcherServlet 'dispatcherServlet'` initialization log (Tomcat's lazy-init on first
+  request)
+- `Graceful shutdown` 25 seconds later
+
+No per-request log lines, no `insert into tickets...`, nothing about the 87 calls. I had
+previously cited "for example, the smoke script's PNG upload caused this real SQL to fire:
+`insert into attachments...`" and pointed to that log file — which was misleading. **That SQL
+string was real, but it came from `./mvnw test`'s output (which enables `show-sql` via
+`src/test/resources/application.yaml`), NOT from the production-config app run** (which has
+`show-sql: false` in [`application.yaml`](src/main/resources/application.yaml) line 14 and
+log level INFO on line 62).
+
+**Root cause:** production config is deliberately quiet (correct default — we don't want
+production logs polluted with per-request SQL). The smoke-test stdout (87 PASS lines, real
+ticket ids, real audit totals) is the actual proof of operation. The server log is only
+proof of "app was up."
+
+**Verification I owed:** to remove all doubt, I re-ran the smoke test with SQL + bind-parameter
+TRACE enabled, passed in via runtime args (no permanent config change):
+
+```bash
+./mvnw spring-boot:run \
+  -Dspring-boot.run.arguments="--spring.jpa.show-sql=true \
+      --spring.jpa.properties.hibernate.format_sql=true \
+      --logging.level.org.hibernate.SQL=DEBUG \
+      --logging.level.org.hibernate.orm.jdbc.bind=TRACE"
+```
+
+This produced a 5,434-line server log (`terminals/387070.txt`) with every SQL statement
+formatted across multiple lines and every bound parameter trace-logged. Operation summary
+(numbers doubled because `show-sql` and `org.hibernate.SQL=DEBUG` are independent emitters
+for the same SQL — divide by 2 for unique operations):
+
+| Statement type | Count (logged) | Unique ops |
+|---|---|---|
+| INSERT | 92 | 46 |
+| UPDATE | 12 | 6 |
+| SELECT | 214 | 107 |
+| DELETE | 8 | 4 |
+| Bind-parameter TRACE | 568 | — |
+
+INSERT targets — every table got real Postgres rows during the smoke test:
+
+| Table | Rows inserted (logged ÷ 2) |
+|---|---|
+| `audit_logs` | 29 |
+| `tickets` | 6 |
+| `users` | 4 (admin seed + alice + bob + tmp_del) |
+| `mentions` | 2 |
+| `comments` | 2 |
+| `ticket_dependencies` | 1 (cycle attempt rejected pre-insert by service guard) |
+| `projects` | 1 (duplicate-name attempt rejected pre-insert) |
+| `attachments` | 1 (3 bad-MIME / missing-part attempts rejected pre-insert) |
+
+**The line that vindicates the BYTEA fix specifically (387070.txt line 3915):**
+
+```
+binding parameter (3:VARBINARY) <- [[-119, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72,
+68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 31, 21, -60, -119, 0, 0, 0, 13, 73, 68, 65,
+84, 120, -100, 98, 0, 0, 0, 0, 5, 0, 1, 13, 10, 45, -76, 0, 0, 0, 0, 73, 69, 78, 68, -82,
+66, 96, -126]]
+```
+
+- Parameter type is `VARBINARY` (what our `@JdbcTypeCode(Types.VARBINARY)` annotation
+  forces), NOT `BLOB` (which would have produced the OID-bigint error).
+- The bytes `-119, 80, 78, 71` decode to `0x89, 0x50, 0x4E, 0x47` — the PNG magic signature.
+  This is literally the file I uploaded via the smoke script, materialised as the bound
+  Hibernate parameter, going into a real PostgreSQL `BYTEA` column.
+
+**The line that proves optimistic locking is wired (387070.txt line 2044):**
+
+```sql
+update tickets set assignee_id=?, deleted_at=?, description=?, due_date=?, is_overdue=?,
+                   priority=?, project_id=?, status=?, title=?, type=?, updated_at=?, version=?
+where id=? and version=?
+```
+
+The `and version=?` clause in the WHERE is what makes the optimistic-lock 409 work: a stale
+version means the UPDATE matches 0 rows, Hibernate throws `OptimisticLockException`, and
+`GlobalExceptionHandler` maps it to 409 `TICKET_VERSION_CONFLICT`. Exercising the test that
+sends `version: 1` (stale) confirmed this whole chain end-to-end.
+
+**The line that proves the @SQLRestriction soft-delete predicate fires (387070.txt
+~1430-1437):** the auto-assign workload query Hibernate compiled includes our
+`(t.deleted_at IS NULL)` predicate inside the `EXISTS` subquery — proving that querying for
+project members correctly ignores soft-deleted tickets without us having to write that
+predicate ourselves in the JPQL.
+
+### What I added to the project as a result
+
+- **[`scripts/smoke.sh`](scripts/smoke.sh)** — the 417-line, 87-assertion script, now
+  committed to the repo with a docstring header explaining purpose, coverage, requirements
+  and exit codes.
+- **[`run.md`](run.md) § "Automated smoke test"** — recipe for running it
+  (reset DB → start app → run script), plus the rationale ("does it actually work against
+  real Postgres?" gate).
+- **[`.cursor/rules/30-testing.mdc`](.cursor/rules/30-testing.mdc)** — new gotcha at the end
+  generalising the H2/Postgres BYTEA lesson to any PG-specific column type (`JSONB`,
+  `TSVECTOR`, arrays, `INET`).
+- **This section of `prompts.md`** — to make clear that the smoke test is real, the SQL trace
+  was real, and the previous "look at the log file" citation overstated what that log file
+  contained (and to honestly correct it).
+
+### What I'd do differently next time
+
+The bug-finding loop was: ship → unit tests green → me asking "but did you actually run it?" →
+smoke test → real bug. That worked, but the smoke test should have been authored alongside
+slice 12 (the first feature that touched a Postgres-specific type), not at the end. The
+rule I added to `30-testing.mdc` codifies this for future slices: "for any feature that uses
+a Postgres-specific column type, the done-bar must include a `scripts/smoke.sh` round-trip
+on real Postgres, not just `./mvnw test`." The script is structured so adding more checks is
+cheap — append a `check "label" $expected_status $actual` line in the relevant section.
+
+

@@ -160,6 +160,30 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   "http://localhost:8080/tickets?projectId=$PROJECT_ID"
 ```
 
+### Automated smoke test (87 assertions, ~3 seconds)
+
+A scripted version covering every endpoint group (auth, users CRUD, projects, tickets+FSM,
+comments+mentions, dependencies+cycle, attachments, CSV, workload, soft-delete+restore, audit,
+logout) lives at `scripts/smoke.sh`. Run against a clean DB:
+
+```bash
+# Reset DB (app must be stopped)
+psql -h localhost -U "$(whoami)" -d postgres -c "DROP DATABASE IF EXISTS issueflow"
+psql -h localhost -U "$(whoami)" -d postgres -c "CREATE DATABASE issueflow OWNER issueflow"
+# Start app, then in another terminal:
+./scripts/smoke.sh   # exit 0 = all 87 checks pass, exit 1 = listed failures
+```
+
+The script also exercises error-path codes (`USER_DUPLICATE_USERNAME`,
+`TICKET_INVALID_TRANSITION`, `TICKET_HAS_OPEN_BLOCKERS`, `DEPENDENCY_CYCLE`, `INVALID_ASSIGNEE`,
+`TICKET_VERSION_CONFLICT`, etc.) and the auth deny-list (post-logout token rejection).
+
+> Why this exists separately from `./mvnw test`: the unit/integration suite runs against H2 in
+> PostgreSQL mode. H2 is a good-enough Postgres emulator for most things but is permissive
+> about some type bindings (notably JDBC `BLOB`/`BYTEA`). This script is the "does it actually
+> work against real Postgres?" gate. See `prompts.md` § "Post-implementation smoke test" for
+> the bug that prompted writing it.
+
 ---
 
 ## 6. Run the test suite
