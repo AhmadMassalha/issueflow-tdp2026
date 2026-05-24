@@ -8,7 +8,10 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.att.tdp.issueflow.assign.service.AutoAssigner;
 import com.att.tdp.issueflow.audit.service.AuditLogService;
+import com.att.tdp.issueflow.common.enums.AuditAction;
+import com.att.tdp.issueflow.common.enums.EntityType;
 import com.att.tdp.issueflow.common.enums.Priority;
 import com.att.tdp.issueflow.common.enums.Role;
 import com.att.tdp.issueflow.common.enums.TicketStatus;
@@ -27,6 +30,7 @@ import com.att.tdp.issueflow.tickets.service.TicketService;
 import com.att.tdp.issueflow.users.domain.User;
 import com.att.tdp.issueflow.users.repository.UserRepository;
 import java.util.Optional;
+import java.util.Set;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -70,6 +74,25 @@ class TicketServiceTest {
     @Mock
     private DependencyService dependencies;
 
+    /**
+     * Slice 13 wiring. Two consumers of the assigner in {@code TicketService}:
+     * <ul>
+     *   <li>{@code create(...)} with omitted {@code assigneeId} calls
+     *       {@link AutoAssigner#pickAssignee(Long)}.</li>
+     *   <li>{@code assertValidAssignee(...)} (called from both create + update
+     *       when assignee is supplied) calls
+     *       {@link AutoAssigner#candidateIdsFor(Long)} for the D7
+     *       membership check.</li>
+     * </ul>
+     * Per-test stubbing — tests that exercise the auto-assign code path
+     * stub {@code pickAssignee} explicitly; tests that exercise the
+     * supplied-assignee path stub {@code candidateIdsFor}. Mockito's
+     * default (returns empty Set / empty Optional) is correct for tests
+     * that bail before reaching the assigner (e.g. project-missing 404).
+     */
+    @Mock
+    private AutoAssigner autoAssigner;
+
     @InjectMocks
     private TicketService service;
 
@@ -112,9 +135,14 @@ class TicketServiceTest {
     // ---- create -------------------------------------------------------------
 
     @Test
-    @DisplayName("Spec 04 §5 — create: defaults status=TODO, isOverdue=false, version starts at 0 (set by JPA)")
+    @DisplayName("Spec 04 §5 + Spec 12 §4 — create: defaults TODO/false/0; auto-assigner returning empty → assigneeId stays null (no error)")
     void should_create_withDefaults() {
+        // Slice 13 D8: this test now covers spec 12 §Algorithm point 4
+        // ("if no candidates exist for that project, set assigneeId =
+        // null. Do NOT raise an error.") in addition to the original
+        // slice-5 defaults assertion. Stub auto-assigner empty.
         when(projects.existsById(1L)).thenReturn(true);
+        when(autoAssigner.pickAssignee(1L)).thenReturn(Optional.empty());
         when(tickets.save(any(Ticket.class))).thenAnswer(inv -> inv.getArgument(0));
 
         Ticket saved = service.create(createReq(1L, null));
@@ -125,8 +153,73 @@ class TicketServiceTest {
         assertThat(persisted.getStatus()).isEqualTo(TicketStatus.TODO);
         assertThat(persisted.isOverdue()).isFalse();
         assertThat(persisted.getProjectId()).isEqualTo(1L);
-        assertThat(persisted.getAssigneeId()).isNull(); // §4: omitted assignee → slice-13 auto-assigner (no-op here)
+        assertThat(persisted.getAssigneeId()).isNull(); // spec 12 §4: no candidates → null
         assertThat(saved).isSameAs(persisted);
+        // CRITICAL: the spec-12 §1 AUTO_ASSIGN row must NOT be written
+        // when no candidate was picked (Session 13 D2).
+        verify(auditLog, never()).logSystem(any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("Spec 12 §Algorithm + §1 — create: omitted assigneeId AND candidate available → auto-assigned + AUTO_ASSIGN/SYSTEM audit row written")
+    void should_autoAssign_andWriteSystemAuditRow_whenAssigneeOmittedAndCandidatesExist() {
+        when(projects.existsById(1L)).thenReturn(true);
+        when(autoAssigner.pickAssignee(1L)).thenReturn(Optional.of(42L));
+        when(tickets.save(any(Ticket.class))).thenAnswer(inv -> {
+            Ticket t = inv.getArgument(0);
+            t.setId(101L); // simulate JPA-generated id so the audit row references the right id
+            return t;
+        });
+
+        service.create(createReq(1L, null));
+
+        ArgumentCaptor<Ticket> captor = ArgumentCaptor.forClass(Ticket.class);
+        verify(tickets).save(captor.capture());
+        assertThat(captor.getValue().getAssigneeId()).isEqualTo(42L);
+
+        // Spec 12 §1: TWO audit rows in the same tx — CREATE/USER then
+        // AUTO_ASSIGN/SYSTEM with diff={"assigneeId":<id>}.
+        verify(auditLog).log(AuditAction.CREATE, EntityType.TICKET, 101L);
+        verify(auditLog).logSystem(
+                AuditAction.AUTO_ASSIGN, EntityType.TICKET, 101L, "{\"assigneeId\":42}");
+    }
+
+    @Test
+    @DisplayName("Spec 12 §1 + Session 13 D2 — create: supplied assigneeId SKIPS auto-assigner AND skips AUTO_ASSIGN audit row")
+    void should_skipAutoAssign_whenAssigneeSupplied() {
+        when(projects.existsById(1L)).thenReturn(true);
+        when(users.findById(7L)).thenReturn(Optional.of(dev(7L)));
+        when(autoAssigner.candidateIdsFor(1L)).thenReturn(Set.of(7L)); // D7 membership pass
+        when(tickets.save(any(Ticket.class))).thenAnswer(inv -> {
+            Ticket t = inv.getArgument(0);
+            t.setId(102L);
+            return t;
+        });
+
+        service.create(createReq(1L, 7L));
+
+        // Auto-assigner consulted ONLY for the D7 membership check, NOT for picking.
+        verify(autoAssigner, never()).pickAssignee(any());
+        // Spec §1: no AUTO_ASSIGN row when the user supplied the assignee.
+        verify(auditLog, never()).logSystem(any(), any(), any(), any());
+        // Spec §6 unchanged: CREATE row still written.
+        verify(auditLog).log(AuditAction.CREATE, EntityType.TICKET, 102L);
+    }
+
+    @Test
+    @DisplayName("Session 13 D7 — create: supplied assignee is DEVELOPER but NOT a project member → 422 INVALID_ASSIGNEE")
+    void should_throw422_whenSuppliedAssigneeIsNotProjectMember() {
+        when(projects.existsById(1L)).thenReturn(true);
+        when(users.findById(7L)).thenReturn(Optional.of(dev(7L)));
+        // D7: assignee is a DEVELOPER, but candidate set for project 1 doesn't contain 7L.
+        when(autoAssigner.candidateIdsFor(1L)).thenReturn(Set.of(42L, 99L));
+
+        assertThatThrownBy(() -> service.create(createReq(1L, 7L)))
+                .isInstanceOf(ValidationException.class)
+                .extracting("code")
+                .isEqualTo(ErrorCode.INVALID_ASSIGNEE);
+
+        verify(tickets, never()).save(any());
     }
 
     @Test
@@ -170,10 +263,11 @@ class TicketServiceTest {
     }
 
     @Test
-    @DisplayName("create: valid DEVELOPER assignee is accepted and persisted")
+    @DisplayName("create: valid DEVELOPER assignee who IS a project member is accepted and persisted")
     void should_create_withValidDeveloperAssignee() {
         when(projects.existsById(1L)).thenReturn(true);
         when(users.findById(7L)).thenReturn(Optional.of(dev(7L)));
+        when(autoAssigner.candidateIdsFor(1L)).thenReturn(Set.of(7L)); // D7 membership pass
         when(tickets.save(any(Ticket.class))).thenAnswer(inv -> inv.getArgument(0));
 
         service.create(createReq(1L, 7L));
@@ -376,11 +470,14 @@ class TicketServiceTest {
     // ---- update: reassignment (D2) -----------------------------------------
 
     @Test
-    @DisplayName("Session-05 D2 — PATCH can reassign; same DEVELOPER-role check applies")
+    @DisplayName("Session-05 D2 + Session 13 D7 — PATCH can reassign; same DEVELOPER + member-of-project checks apply")
     void should_reassignOnPatch_whenAssigneeIsDeveloper() {
         Ticket cur = existing(1L, TicketStatus.IN_PROGRESS, Priority.MEDIUM, 1L);
         when(tickets.findById(1L)).thenReturn(Optional.of(cur));
         when(users.findById(9L)).thenReturn(Optional.of(dev(9L)));
+        // D7: membership checked against the EXISTING ticket's projectId
+        // (PATCH body doesn't carry projectId — spec 04 §2 makes it immutable).
+        when(autoAssigner.candidateIdsFor(1L)).thenReturn(Set.of(9L));
 
         PatchTicketRequest req = new PatchTicketRequest(
                 null, null, null, null, null, /*assigneeId=*/ 9L, null, 1L);

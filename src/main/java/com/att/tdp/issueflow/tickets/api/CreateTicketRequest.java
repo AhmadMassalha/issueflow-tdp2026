@@ -15,9 +15,11 @@ import java.time.Instant;
  *
  * <p>{@code status} is optional — when omitted the service defaults to
  * {@link TicketStatus#TODO} (spec 04 entity table). {@code assigneeId} is
- * optional and (per Session-05 D1) validated as "exists AND DEVELOPER" when
- * supplied; when omitted, slice 13's auto-assigner will fill it in. Until
- * slice 13 ships, omitted {@code assigneeId} stays {@code null}.
+ * optional: when supplied, slice 13 D7 validates it as "exists AND DEVELOPER
+ * AND member of the project" (membership per ADR 0007); when omitted,
+ * slice 13's {@code AutoAssigner} fills it in by picking the lowest-load
+ * DEVELOPER project member (spec 12 §Algorithm). If no candidates exist,
+ * the ticket lands with {@code assigneeId = null} per spec 12 §4 — no error.
  *
  * <p>Three enum deserializers are wired so unknown values produce
  * feature-specific 400 codes ({@code TICKET_INVALID_*}) with a {@code details[]}

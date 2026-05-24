@@ -32,8 +32,10 @@ import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBo
  * orchestrates over {@code tickets/} without polluting it.
  *
  * <p><b>RBAC:</b> {@code @PreAuthorize("isAuthenticated()")} — any
- * authenticated user can export/import (project-membership concerns
- * deferred to slice 13).
+ * authenticated user can export/import. Per-project membership gating
+ * (e.g. "only members can import to project X") is not in spec 10;
+ * slice 13 wired membership-based assignee validation but did not
+ * tighten the import endpoint itself.
  *
  * <p><b>Import is NOT idempotent.</b> Re-uploading the same file creates
  * a fresh set of tickets with new ids. Round-trip id preservation is

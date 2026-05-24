@@ -49,13 +49,16 @@ public class CsvImportRowExecutor {
      * state visible to subsequent rows.
      *
      * @return the id of the newly-created ticket (handy for tests + the
-     *         auto-assign hook slice 13 will add).
+     *         slice-13 auto-assigner audit-row assertion in
+     *         {@code AutoAssignIntegrationTest}).
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public Long createInIsolation(CreateTicketRequest req) {
-        // TODO(slice-13): when auto-assigner lands, the call inside
-        // TicketService.create will route req.assigneeId() through it
-        // when null — no change needed here. See spec 10 §10.
+        // Slice 13: CSV import inherits auto-assignment automatically.
+        // TicketService.create() now routes a null req.assigneeId()
+        // through AutoAssigner.pickAssignee(projectId) and writes the
+        // spec-12 §1 AUTO_ASSIGN/SYSTEM audit row in the same REQUIRES_NEW
+        // tx — per-row isolation extends to the auto-assign side-effect.
         return tickets.create(req).getId();
     }
 }

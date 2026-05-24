@@ -1,5 +1,6 @@
 package com.att.tdp.issueflow.tickets.service;
 
+import com.att.tdp.issueflow.assign.service.AutoAssigner;
 import com.att.tdp.issueflow.audit.service.AuditLogService;
 import com.att.tdp.issueflow.common.enums.AuditAction;
 import com.att.tdp.issueflow.common.enums.EntityType;
@@ -27,14 +28,17 @@ import org.springframework.transaction.annotation.Transactional;
 /**
  * Business logic for the {@code tickets} feature.
  *
- * <p>Implements spec 04 §1–§12 except the parts owned by later slices:
+ * <p>Implements spec 04 §1–§12. Cross-slice wiring history:
  * <ul>
- *   <li>§4 auto-assignment when {@code assigneeId} is omitted — slice 13.
- *       Until then, omitted {@code assigneeId} stays {@code null}; a TODO
- *       marker is in {@link #create} where the auto-assigner plugs in.</li>
- *   <li>§4 "DEVELOPER active in that project" check — slice 13 (project
- *       membership). For now, we validate only the role half: assignee must
- *       exist and have {@link Role#DEVELOPER}. Session-05 D1 / prompts.md.</li>
+ *   <li>§4 auto-assignment when {@code assigneeId} is omitted — wired in
+ *       slice 13 via {@link AutoAssigner#pickAssignee(Long)}, called
+ *       inside {@link #create} in the same transaction. Writes a
+ *       {@code AUTO_ASSIGN/SYSTEM} audit row when a candidate is found
+ *       (spec 12 §1).</li>
+ *   <li>§4 "DEVELOPER active in that project" check — slice 13 D7 closes
+ *       the Session-05 D1 deferral. {@link #assertValidAssignee} now
+ *       checks both halves: role = DEVELOPER AND member of the project
+ *       (ADR 0007). Same enforcement on POST and PATCH.</li>
  *   <li>§9 "transition to DONE blocked by open blockers" — wired in slice 8
  *       via {@link DependencyService#hasOpenBlockers(Long)}, called inside
  *       the FSM block below before applying the new status.</li>
@@ -57,6 +61,7 @@ public class TicketService {
     private final UserRepository users;
     private final AuditLogService auditLog;
     private final DependencyService dependencies;
+    private final AutoAssigner autoAssigner;
 
     @Transactional(readOnly = true)
     public List<Ticket> findByProjectId(Long projectId) {
@@ -73,19 +78,31 @@ public class TicketService {
     // ---- create -------------------------------------------------------------
 
     public Ticket create(CreateTicketRequest req) {
-        // §3: project must exist (and not be soft-deleted, which @SQLRestriction
-        // handles automatically once slice 9 lands).
+        // §3: project must exist (and not be soft-deleted — slice-9
+        // @SQLRestriction handles that automatically).
         if (!projects.existsById(req.projectId())) {
             throw new NotFoundException(
                     ErrorCode.PROJECT_NOT_FOUND,
                     "Project " + req.projectId() + " was not found.");
         }
-        // §4 (partial): if supplied, validate exists + DEVELOPER role.
-        if (req.assigneeId() != null) {
-            assertValidAssignee(req.assigneeId());
+
+        // §4: assignee resolution. Slice 13:
+        //   * If supplied, validate it's a DEVELOPER AND a member of THIS
+        //     project (D7 closes Session-05 D1's deferred half).
+        //   * If omitted, ask the auto-assigner. Empty Optional → leave null
+        //     per spec 12 §Algorithm point 4 ("if no candidates exist for
+        //     that project, set assigneeId = null. Do NOT raise an error.").
+        Long resolvedAssigneeId = req.assigneeId();
+        boolean autoAssigned = false;
+        if (resolvedAssigneeId != null) {
+            assertValidAssignee(resolvedAssigneeId, req.projectId());
+        } else {
+            Optional<Long> picked = autoAssigner.pickAssignee(req.projectId());
+            if (picked.isPresent()) {
+                resolvedAssigneeId = picked.get();
+                autoAssigned = true;
+            }
         }
-        // TODO(slice-13): if req.assigneeId() == null, invoke AutoAssigner here.
-        // Until then, leave null and rely on a later PATCH to set the assignee.
 
         Ticket t = new Ticket();
         t.setTitle(req.title());
@@ -94,11 +111,26 @@ public class TicketService {
         t.setPriority(req.priority());
         t.setType(req.type());
         t.setProjectId(req.projectId());
-        t.setAssigneeId(req.assigneeId());
+        t.setAssigneeId(resolvedAssigneeId);
         t.setDueDate(req.dueDate());
         t.setOverdue(false);    // §5: isOverdue:false on create
         Ticket saved = tickets.save(t); // @Version starts at 0 on insert
+
+        // Spec 06 §1: USER actor for the create itself.
         auditLog.log(AuditAction.CREATE, EntityType.TICKET, saved.getId());
+
+        // Spec 12 §1: SECOND row for the auto-assignment, actor=SYSTEM,
+        // diff={"assigneeId":<id>}. Same transaction as the CREATE row
+        // and the entity save (spec 12 §4) — failure rolls all three back.
+        // Session 13 D2: two rows, not a reshaped CREATE — actors differ
+        // (the POSTer did the create; the system did the assignment).
+        if (autoAssigned) {
+            auditLog.logSystem(
+                    AuditAction.AUTO_ASSIGN,
+                    EntityType.TICKET,
+                    saved.getId(),
+                    "{\"assigneeId\":" + resolvedAssigneeId + "}");
+        }
         return saved;
     }
 
@@ -135,9 +167,12 @@ public class TicketService {
                     "Ticket " + id + " is DONE and cannot be modified.");
         }
 
-        // Reassignment (Session-05 D2): same rules as on create.
+        // Reassignment (Session-05 D2): same rules as on create. Slice 13 D7
+        // — membership is checked against the EXISTING ticket's project
+        // (the PATCH body does NOT carry projectId; spec 04 §2 makes
+        // project immutable after create).
         if (req.assigneeId() != null) {
-            assertValidAssignee(req.assigneeId());
+            assertValidAssignee(req.assigneeId(), existing.getProjectId());
             existing.setAssigneeId(req.assigneeId());
         }
 
@@ -264,10 +299,26 @@ public class TicketService {
     // ---- helpers ------------------------------------------------------------
 
     /**
-     * §4 (partial — Session-05 D1): assignee must exist and have the DEVELOPER role.
-     * The "active in that project" half is deferred to slice 13 (project membership).
+     * §4 — assignee validation. Slice 13 D7 closes the Session-05 D1
+     * deferred half: assignee must be (a) an existing DEVELOPER user AND
+     * (b) a member of the target project per ADR 0007 (owner ∪
+     * has-a-ticket-here). The membership check delegates to
+     * {@link AutoAssigner#candidateIdsFor(Long)} so there is a single
+     * source of truth for "is X eligible to be assigned in project P".
+     *
+     * <p>The two checks fire in order: existence-and-role first (cheaper,
+     * doesn't touch the workload query), then membership. Both failures
+     * surface as the same {@code INVALID_ASSIGNEE} 422 with a field-issue
+     * pointing at {@code assigneeId} — the spec doesn't distinguish, and
+     * the message text disambiguates for the human reader.
+     *
+     * <p><b>Why pass {@code projectId} explicitly</b> instead of looking it
+     * up from the ticket: on POST the ticket doesn't exist yet (the value
+     * comes from the request body); on PATCH it does (read from the
+     * loaded entity). The caller knows which one to pass; the helper
+     * stays simple.
      */
-    private void assertValidAssignee(Long assigneeId) {
+    private void assertValidAssignee(Long assigneeId, Long projectId) {
         Optional<User> u = users.findById(assigneeId);
         if (u.isEmpty() || u.get().getRole() != Role.DEVELOPER) {
             throw new ValidationException(
@@ -276,6 +327,18 @@ public class TicketService {
                     List.of(new ApiError.FieldIssue(
                             "assigneeId",
                             "must reference an existing user with role DEVELOPER")));
+        }
+        // Slice 13 D7 — membership check via the same workload query that
+        // backs the auto-assigner + the /workload endpoint. One source of
+        // truth for ADR 0007.
+        if (!autoAssigner.candidateIdsFor(projectId).contains(assigneeId)) {
+            throw new ValidationException(
+                    ErrorCode.INVALID_ASSIGNEE,
+                    "Assignee " + assigneeId + " is not a member of project " + projectId
+                            + " (a member is the owner or has at least one ticket in the project).",
+                    List.of(new ApiError.FieldIssue(
+                            "assigneeId",
+                            "must be a member of the target project (owner or has-a-ticket-here)")));
         }
     }
 }

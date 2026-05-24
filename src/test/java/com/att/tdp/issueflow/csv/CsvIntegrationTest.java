@@ -150,8 +150,14 @@ class CsvIntegrationTest {
     // ---- spec §9 audit invariant ------------------------------------------
 
     @Test
-    @DisplayName("Spec 10 §9: ONE audit row per successfully imported ticket (action=CREATE, actor=USER)")
+    @DisplayName("Spec 10 §9 + slice 13: ONE CREATE row + ONE AUTO_ASSIGN row per imported ticket when auto-assignment fires")
     void importSuccess_writesOneAuditRowPerTicket() throws Exception {
+        // Slice 13 inheritance: CSV rows without explicit `assigneeId` now
+        // trigger AutoAssigner inside TicketService.create (via the per-row
+        // REQUIRES_NEW wrapper in CsvImportRowExecutor — no new code there).
+        // The `dev` fixture is the project owner AND a DEVELOPER (ADR 0007
+        // bootstrap-member), so they're the sole candidate for every row →
+        // each row writes 2 audit rows (CREATE/USER + AUTO_ASSIGN/SYSTEM).
         String csv = """
                 id,title,description,status,priority,type,assigneeId,dueDate
                 ,Imp1,d1,,LOW,BUG,,
@@ -170,13 +176,36 @@ class CsvIntegrationTest {
                 .andExpect(jsonPath("$.created").value(3));
 
         List<AuditLog> rows = auditLogs.findAll();
-        assertThat(rows).hasSize(3);
-        assertThat(rows).allSatisfy(r -> {
-            assertThat(r.getAction()).isEqualTo(AuditAction.CREATE);
+        // 3 created tickets × 2 audit rows each = 6.
+        assertThat(rows).hasSize(6);
+
+        // Spec 10 §9 — one CREATE/USER row per imported ticket.
+        List<AuditLog> createRows = rows.stream()
+                .filter(r -> r.getAction() == AuditAction.CREATE)
+                .toList();
+        assertThat(createRows).hasSize(3);
+        assertThat(createRows).allSatisfy(r -> {
             assertThat(r.getEntityType()).isEqualTo(EntityType.TICKET);
             assertThat(r.getActor()).isEqualTo(Actor.USER);
             assertThat(r.getPerformedBy()).isEqualTo(dev.getId());
         });
+
+        // Spec 12 §1 — one AUTO_ASSIGN/SYSTEM row per imported ticket
+        // (because each ticket was actually auto-assigned to `dev`).
+        List<AuditLog> assignRows = rows.stream()
+                .filter(r -> r.getAction() == AuditAction.AUTO_ASSIGN)
+                .toList();
+        assertThat(assignRows).hasSize(3);
+        assertThat(assignRows).allSatisfy(r -> {
+            assertThat(r.getEntityType()).isEqualTo(EntityType.TICKET);
+            assertThat(r.getActor()).isEqualTo(Actor.SYSTEM);
+            assertThat(r.getPerformedBy()).isNull();
+            assertThat(r.getDiff()).isEqualTo("{\"assigneeId\":" + dev.getId() + "}");
+        });
+
+        // The audit-row pairs share entity ids (one CREATE + one AUTO_ASSIGN per ticket).
+        assertThat(createRows.stream().map(AuditLog::getEntityId).sorted().toList())
+                .isEqualTo(assignRows.stream().map(AuditLog::getEntityId).sorted().toList());
     }
 
     // ---- spec §8 REQUIRES_NEW: per-row isolation across the wire ---------
@@ -210,8 +239,17 @@ class CsvIntegrationTest {
         assertThat(persisted).extracting(Ticket::getTitle)
                 .containsExactlyInAnyOrder("GoodA", "GoodB");
 
-        // Audit invariant: exactly two CREATE rows, no row for the failed import.
-        assertThat(auditLogs.findAll()).hasSize(2);
+        // Audit invariant: exactly two CREATE/USER rows + two AUTO_ASSIGN/
+        // SYSTEM rows (slice 13 — the project owner `dev` is the lone
+        // candidate and auto-assignment fires per row). The failing row's
+        // REQUIRES_NEW tx rolled back BOTH its potential audit rows along
+        // with the ticket itself — the failure is hermetic per spec 10 §8.
+        List<AuditLog> all = auditLogs.findAll();
+        assertThat(all).hasSize(4);
+        assertThat(all.stream().filter(r -> r.getAction() == AuditAction.CREATE).toList())
+                .hasSize(2);
+        assertThat(all.stream().filter(r -> r.getAction() == AuditAction.AUTO_ASSIGN).toList())
+                .hasSize(2);
     }
 
     // ---- spec §7 wrong MIME -----------------------------------------------

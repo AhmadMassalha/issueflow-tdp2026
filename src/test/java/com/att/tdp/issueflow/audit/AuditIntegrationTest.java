@@ -274,8 +274,14 @@ class AuditIntegrationTest {
     // ---- TICKET -------------------------------------------------------------
 
     @Test
-    @DisplayName("TICKET create via POST /tickets → {CREATE, TICKET, performedBy=dev.id}")
+    @DisplayName("TICKET create via POST /tickets → {CREATE, TICKET, performedBy=dev.id} + slice-13 AUTO_ASSIGN/SYSTEM row when auto-assigned")
     void ticketCreate_writesAuditRow() throws Exception {
+        // Slice 13: the dev fixture is the project owner AND a DEVELOPER, so
+        // they're the only auto-assign candidate (ADR 0007 — owner-as-
+        // bootstrap-member). Posting without `assigneeId` triggers
+        // AutoAssigner, which picks dev.id, and TicketService writes TWO
+        // audit rows in the same tx (spec 12 §1 + Session 13 D2): the
+        // user-actor CREATE row and the system-actor AUTO_ASSIGN row.
         String token = login("dev-it", "dev-pw");
         Project p = persistProject("P-T1", dev.getId());
         auditLogs.deleteAll();
@@ -288,7 +294,21 @@ class AuditIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON).content(body))
                 .andExpect(status().isOk());
 
-        assertOneRow(AuditAction.CREATE, EntityType.TICKET, dev.getId());
+        List<AuditLog> rows = auditLogs.findAll();
+        assertThat(rows).hasSize(2);
+        AuditLog createRow = rows.stream()
+                .filter(r -> r.getAction() == AuditAction.CREATE).findFirst().orElseThrow();
+        assertThat(createRow.getEntityType()).isEqualTo(EntityType.TICKET);
+        assertThat(createRow.getActor()).isEqualTo(Actor.USER);
+        assertThat(createRow.getPerformedBy()).isEqualTo(dev.getId());
+
+        AuditLog autoAssignRow = rows.stream()
+                .filter(r -> r.getAction() == AuditAction.AUTO_ASSIGN).findFirst().orElseThrow();
+        assertThat(autoAssignRow.getEntityType()).isEqualTo(EntityType.TICKET);
+        assertThat(autoAssignRow.getActor()).isEqualTo(Actor.SYSTEM);
+        assertThat(autoAssignRow.getPerformedBy()).isNull(); // SYSTEM rows carry no performedBy
+        assertThat(autoAssignRow.getEntityId()).isEqualTo(createRow.getEntityId());
+        assertThat(autoAssignRow.getDiff()).isEqualTo("{\"assigneeId\":" + dev.getId() + "}");
     }
 
     @Test

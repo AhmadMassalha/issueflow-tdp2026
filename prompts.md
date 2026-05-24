@@ -1315,6 +1315,112 @@ That's it — **one production bug, in pre-existing code, surfaced by the first 
 
 ---
 
+## Session 13 — Auto-assignment by workload (spec 12)
+**Goal:** `docs/spec/12-auto-assign.md` §1–§4 — auto-assign new tickets to the
+lowest-loaded developer when the request omits `assigneeId`, expose a
+`/projects/{id}/workload` endpoint, and write the spec'd `AUTO_ASSIGN/SYSTEM`
+audit row in the same transaction as the create. Also closes:
+
+- Slice 5 D1's deferred half ("assignee must be active in that project") — now
+  validated via the same membership query.
+- Slice 11 D3's `TODO(slice-13)` in `CsvImportRowExecutor` — CSV imports
+  inherit auto-assignment automatically through the per-row
+  `TicketService.create()` call.
+
+**Decisions (D1–D10) — user approved all my recommendations:**
+
+| # | Decision | Choice (rationale) |
+|---|---|---|
+| D1 | "Project member" definition | **Spec-literal implicit definition**: `members(pid) = {owner} ∪ {users with ≥1 ticket in pid}`, intersected with `role = DEVELOPER` for the auto-assign candidate set. Formalized in **ADR 0007**. No `project_members` join table. Owner-without-tickets is the bootstrap case (otherwise a fresh project's first ticket can never auto-assign). |
+| D2 | Audit row strategy on auto-assign | **Two rows in the same `@Transactional`**: existing `CREATE/USER/TICKET` row + new `AUTO_ASSIGN/SYSTEM/TICKET` row with `diff = {"assigneeId": <id>}`. Spec §1 says "one audit row is written: actor=SYSTEM, action=AUTO_ASSIGN" — that's a separate row from the CREATE. Conflating them would lie about who did what (CREATE actor = the POSTer; AUTO_ASSIGN actor = SYSTEM). Same idiom as slice-7's AdminSeeder writing SYSTEM rows. |
+| D3 | Where the auto-assigner is invoked | **Inline call from `TicketService.create()`**: after entity construction, before `tickets.save(t)`, call `autoAssigner.pickAssignee(projectId)` and set the id on the entity if non-null. AUTO_ASSIGN audit row written after save (needs the id). REQUIRED propagation — same tx as create per spec §4. CSV importer's per-row `REQUIRES_NEW` wrapper picks this up for free (closes slice-11 D3 TODO with zero new code in the importer). |
+| D4 | Workload query placement | **Single JPQL in `UserRepository.findWorkloadForProject(pid)`** returning `(userId, username, openTicketCount)`. LEFT JOIN Ticket filtered by `status != DONE`; WHERE intersects DEVELOPERs with the membership predicate; GROUP BY user; ORDER BY count ASC, id ASC. One trip. Reused by both auto-assigner and workload endpoint (D5). |
+| D5 | Workload endpoint shape | **`GET /projects/{projectId}/workload` → `List<WorkloadEntry>`**, not paginated (membership is bounded by participation, usually small). Project existence checked first → 404 PROJECT_NOT_FOUND if missing or soft-deleted (slice-9 `@SQLRestriction` makes this free). Sort done in SQL. |
+| D6 | AutoAssigner as separate service vs static helper in TicketService | **Separate `AutoAssigner` service** in `assign/service/`. Three reasons: (1) workload calc is shared between auto-assign and the endpoint — DRY; (2) testable in isolation with Mockito; (3) future "manual reassign by lowest-load" admin endpoint would also call it. Single-responsibility. |
+| D7 | Close slice-5 D1 deferred half | **Yes, in this slice.** `TicketService.assertValidAssignee(assigneeId, projectId)` now takes projectId and checks the member set via the same workload query — if assignee isn't in `candidatesFor(projectId)`, return 422 INVALID_ASSIGNEE with field-issue shape (existing code, no new error). Applies on POST and PATCH. The slice-5 TODO marker becomes "implemented in slice 13 D7." |
+| D8 | Existing test `create_omittedAssignee_staysNull` | **Update, don't delete.** Mock AutoAssigner.pickAssignee returning Optional.empty() → assert same null outcome. Now tests spec §"Algorithm" point 4 ("if no candidates exist, set assigneeId = null. Do NOT raise an error.") explicitly. Add a sibling test for the populated case. |
+| D9 | RBAC on `/projects/{id}/workload` | **`@PreAuthorize("isAuthenticated()")`** — workload data is project-scoped operational info; spec is silent on roles. Consistent with ADR 0006 (open reads on /projects). |
+| D10 | Test strategy | **4 test classes** (~25 tests): `AutoAssignerTest` (Mockito: tie-break, no candidates, owner-as-bootstrap-member, ADMIN excluded, soft-deleted tickets excluded from counts, equal-load lowest-id wins); `WorkloadServiceTest` (project not found, sort order); `WorkloadControllerWebMvcTest` (200 happy, 404, response shape); `AutoAssignIntegrationTest` (POST /tickets with no assignee → assigned + TWO audit rows in one tx; CSV import inherits auto-assign; manual assigneeId on POST skips auto-assigner; soft-deleted project → 404 on workload). |
+
+**Obvious / non-decisions:**
+- Zero new `ErrorCode` / `AuditAction` / `EntityType` — `AuditAction.AUTO_ASSIGN`
+  + `Actor.SYSTEM` were pre-seeded in slice 1. `INVALID_ASSIGNEE` +
+  `PROJECT_NOT_FOUND` already exist. **9th consecutive slice** with no enum
+  churn.
+- The diff format `{"assigneeId": <id>}` is straight from spec §1.
+- `AuditLogService.logSystem(...)` is the API the auto-assigner uses — slice-7
+  D6 explicitly designed the overload "for AdminSeeder + slice-13 auto-assigner
+  + slice-14 scheduler" callers (the JavaDoc literally names slice 13).
+- Project owner who is ADMIN (not DEVELOPER) is filtered out by the role
+  predicate. Documented in ADR 0007 as an accepted edge case — the
+  auto-assigner falls through to "no candidates → null" per spec §4 point 4,
+  which is correct behavior.
+
+**Touch list:**
+- New ADR: `docs/decisions/0007-project-membership.md` (formalizing D1).
+- New main (~5 files): `assign/service/AutoAssigner`, `assign/service/WorkloadService`, `assign/api/WorkloadController`, `assign/api/WorkloadEntry`. New repo method on `UserRepository`.
+- Modified main (~3 files): `TicketService.create()` invokes auto-assigner + writes AUTO_ASSIGN row; `TicketService.assertValidAssignee()` takes projectId + checks membership (D7); `CreateTicketRequest` + `PatchTicketRequest` JavaDoc updated (slice-13 TODO marker becomes "implemented").
+- 4 new test classes + ~2 existing test updates.
+
+**Prompt (verbatim):**
+> Build slice 13 (Auto-assign by workload) per `docs/spec/12-auto-assign.md`. New `assign/` feature module: `AutoAssigner` service with `pickAssignee(projectId)` returning `Optional<Long>` (lowest open-ticket count among DEVELOPER members of the project per ADR 0007 — `members = owner ∪ users-with-tickets`, intersected with `role = DEVELOPER`; tie-break by lowest userId; empty Optional if no candidates), `WorkloadService.forProject(projectId)` returning `List<WorkloadEntry>` (project existence first → 404), `WorkloadEntry` record `{userId, username, openTicketCount}`, `WorkloadController` with `GET /projects/{projectId}/workload`. New `UserRepository.findWorkloadForProject(projectId)` JPQL projection returning `(userId, username, openTicketCount)` sorted ASC,ASC — covers both consumers. Wire `AutoAssigner` into `TicketService.create()`: when `req.assigneeId() == null`, call `autoAssigner.pickAssignee(req.projectId())`, set on entity if non-null, write `AUTO_ASSIGN/SYSTEM/TICKET` audit row after save (in the same `@Transactional` per spec §4) with `diff = {"assigneeId": <id>}`. Tighten `TicketService.assertValidAssignee(assigneeId, projectId)` (D7): add membership check — if assignee isn't in `autoAssigner.candidateIdsFor(projectId)`, throw 422 INVALID_ASSIGNEE. Update existing `TicketServiceTest.create_omittedAssignee_staysNull` to mock auto-assigner returning empty (D8) + add sibling test for populated case. Tests: `AutoAssignerTest` (tie-break, no candidates, owner-as-bootstrap, ADMIN excluded, soft-deleted tickets excluded from counts, lowest-id wins on tie), `WorkloadServiceTest` (project not found, sort order, ADMIN excluded), `WorkloadControllerWebMvcTest` (200 happy, 404, response shape), `AutoAssignIntegrationTest` (end-to-end auto-assign on POST /tickets → assignee populated + TWO audit rows CREATE+AUTO_ASSIGN in one tx, CSV import path inherits auto-assignment via existing REQUIRES_NEW wrapper, manual assigneeId skips auto-assigner, soft-deleted project workload → 404, spec §4 same-tx atomicity).
+
+**AI output (what shipped, files touched):**
+- New ADR: `docs/decisions/0007-project-membership.md` — formalises the
+  spec-literal implicit membership definition (Session 13 D1), captures
+  the bootstrap-owner edge case, lists the asymmetry of "owner-without-
+  tickets is still a member," and documents the migration path to an
+  explicit `project_members` table if a future deployment ever needs it.
+- New main (5 files):
+  - `assign/api/WorkloadEntry.java` — record `{userId, username, openTicketCount}`. Both a response DTO and a JPQL projection target (constructor-order coupled to `u.id, u.username, count(t.id)`).
+  - `assign/api/WorkloadController.java` — `GET /projects/{projectId}/workload` returning `List<WorkloadEntry>` (no pagination — D5). `@PreAuthorize("isAuthenticated()")` per D9. Top-level controller (not method on `ProjectController`) — same idiom as slice-8's `TicketDependencyController`.
+  - `assign/service/AutoAssigner.java` — `pickAssignee(projectId)` returns `Optional<Long>` (head of the spec-sorted workload list, or empty per spec §4); `candidateIdsFor(projectId)` returns the membership set for D7's validation. Both methods reuse the same JPQL trip so there is ONE source of truth for ADR 0007 (no risk of the membership predicate drifting between two queries). `@Transactional(SUPPORTS, readOnly=true)` — participates in the caller's tx when called from inside `TicketService.create()`, runs without a tx for the standalone `/workload` endpoint.
+  - `assign/service/WorkloadService.java` — wrapper for the endpoint. Two lines of logic: existence check → 404, or delegate. Sort happens in SQL, not Java.
+  - `UserRepository.findWorkloadForProject(projectId)` — JPQL with LEFT JOIN Ticket (filtered by status != DONE), WHERE clause encoding the ADR 0007 membership predicate (owner OR has-a-ticket), GROUP BY, ORDER BY (count ASC, userId ASC). One trip. Uses `@SQLRestriction` on `Ticket` (slice 9) transparently so soft-deleted rows drop out of both the EXISTS and the COUNT.
+- Modified main (3 files):
+  - `TicketService.create()` — added an `Optional<Long>` resolution step before `tickets.save(t)`: if `req.assigneeId()` is null, call `autoAssigner.pickAssignee(req.projectId())`; if a candidate is picked, set on entity AND mark `autoAssigned=true`. After the save, write the `AUTO_ASSIGN/SYSTEM` row with the spec §1 diff verbatim — but ONLY when `autoAssigned` (D2: no row when no one was actually assigned).
+  - `TicketService.assertValidAssignee(assigneeId, projectId)` — closes Session 05 D1's deferred half (D7). New second guard: assignee must be in `autoAssigner.candidateIdsFor(projectId)`, else 422 INVALID_ASSIGNEE with a different message text but the same code (callers can disambiguate by the message).
+  - `TicketService.update()` — passes `existing.getProjectId()` to the tightened helper since PATCH doesn't carry projectId (spec 04 §2: project immutable).
+- Modified docs:
+  - `CsvImportRowExecutor.java` — replaced the `TODO(slice-13)` marker with a note explaining how CSV imports inherit auto-assignment for free.
+  - `CsvController.java` — JavaDoc updated to reflect that slice 13 closed the membership-validation gap (without tightening the import endpoint itself).
+  - `CreateTicketRequest.java` — JavaDoc updated to document the new "supplied → validated as DEVELOPER + member" + "omitted → auto-assigner" behavior.
+
+- 4 new test classes (+22 tests, two existing-test rewrites):
+  - `AutoAssignerTest` (6 Mockito tests) — head-picking, tie-break trust (assigner trusts SQL ordering, doesn't re-sort), empty list per spec §4 point 4, single-candidate trivial case, candidate-id-set projection, empty-set behavior.
+  - `WorkloadServiceTest` (2 Mockito tests) — happy passthrough (same reference back, no Java-side sort), missing/soft-deleted project → 404 with repo never queried.
+  - `WorkloadControllerWebMvcTest` (3 WebMvc tests) — spec-verbatim response field names (`userId` not `id`, `openTicketCount` not `count`), 404 path, empty workload returns `[]` not null.
+  - `AutoAssignIntegrationTest` (8 `@SpringBootTest` tests) — spec §1 + §4 atomicity (CREATE + AUTO_ASSIGN in same tx with right actors / diff); spec §Algorithm point 3 real JPQL tie-break by lowest userId (with a DONE ticket seeded to make both devs members but keep open-counts tied at 0); ADR 0007 owner-as-bootstrap-member on a fresh project; spec §4 point 4 no-candidates path (ADMIN owner only → null assignee, NO AUTO_ASSIGN row); spec §2 ADMIN exclusion via the workload endpoint; spec §3 soft-deleted project → 404 through real `@SQLRestriction`; **slice 11 inheritance** (CSV import auto-assigns through unchanged `CsvImportRowExecutor` — each imported row gets CREATE + AUTO_ASSIGN pair); Session 13 D7 supplied non-member assignee → 422 end-to-end.
+- Updated existing tests:
+  - `TicketServiceTest`: re-stubbed `should_create_withDefaults` to mock `pickAssignee → empty` (D8 — now covers spec §4 point 4 explicitly); added `should_autoAssign_andWriteSystemAuditRow_whenAssigneeOmittedAndCandidatesExist`; added `should_skipAutoAssign_whenAssigneeSupplied`; added `should_throw422_whenSuppliedAssigneeIsNotProjectMember` (D7 unit test); updated `should_create_withValidDeveloperAssignee` and `should_reassignOnPatch_whenAssigneeIsDeveloper` to stub `candidateIdsFor` returning a Set containing the assignee.
+  - `AuditIntegrationTest.ticketCreate_writesAuditRow` — updated to assert TWO audit rows (CREATE/USER + AUTO_ASSIGN/SYSTEM) because the test fixture's `dev` is the project owner and a DEVELOPER, so they're the lone auto-assign candidate. Also verifies the diff string matches the spec verbatim.
+  - `CsvIntegrationTest.importSuccess_writesOneAuditRowPerTicket` — updated from "3 rows expected" to "6 rows expected (3 CREATE + 3 AUTO_ASSIGN)" with stronger assertions on the structural pairing (CREATE entityIds == AUTO_ASSIGN entityIds when sorted). Locks in the slice-11-inherits-slice-13 contract.
+  - `CsvIntegrationTest.perRowIsolation_realTxBoundary` — updated from "2 rows" to "4 rows (2 CREATE + 2 AUTO_ASSIGN)" with assertions on the split by action.
+
+**Bugs caught:**
+1. **Audit log pollution from `/auth/login`** — `AutoAssignIntegrationTest.autoAssignedTicket_writesTwoAuditRowsInOneTx` expected 2 audit rows but got 3 on first run (LOGIN + CREATE + AUTO_ASSIGN); `create_suppliedAssigneeNotMember_returns422` expected 0 but got 1 (the LOGIN row). Root cause: `/auth/login` writes a `LOGIN/USER` audit row (slice 3 + slice 7's `logAs` overload), but my test wipe pattern only cleared audits in `@BeforeEach` BEFORE the login. Fix: add `auditLogs.deleteAll()` AFTER the `login(...)` call but BEFORE the under-test action. `CsvIntegrationTest` already had this pattern from slice 11, which is why it didn't trip on the same boundary. Promoted to `.cursor/rules/30-testing.mdc` as a Gotcha so the next integration test that asserts audit-row counts gets the wipe-after-login boilerplate from day one.
+
+**Zero bugs in the new slice-13 code itself** — the production code worked on the first integration run; both failures were test fixture issues. The strong existing test wiring (slice-7's audit-row-per-state-change invariant) caught the cross-cutting wiring change (slice-13's NEW AUTO_ASSIGN side effect on EVERY ticket create) the moment we ran the suite: 3 pre-existing tests turned red because their assertions assumed the pre-slice-13 contract. Updating them was the test-driven proof that the new wiring landed correctly.
+
+**Suite:** **449/449 green** (+22 vs slice 12's 427). The +22 comprises 19 net new tests (6+2+3+8) plus 3 new tests added inside the existing `TicketServiceTest`. Surefire ~22s.
+
+**Design wins / lessons:**
+- **One JPQL trip, two consumers** (`AutoAssigner.pickAssignee` + `WorkloadController` GET endpoint, both via `UserRepository.findWorkloadForProject`). The membership predicate lives in ONE place — when ADR 0007 ever changes, exactly one query needs to be updated. The `candidateIdsFor(projectId)` re-uses the same query (just projects the user ids) rather than introducing a sibling query that could drift.
+- **The slice-11 CSV importer needed zero new code** to inherit auto-assignment. `CsvImportRowExecutor.createInIsolation()` already routes through `TicketService.create()`, which is exactly where the new auto-assigner hook lives. The integration test (`csvImport_inheritsAutoAssign`) proves this — 4 audit rows for 2 imported tickets = the slice-13 contract carrying through the slice-11 per-row REQUIRES_NEW boundary cleanly.
+- **D2's "two audit rows" choice paid off when reading existing tests.** Updating `AuditIntegrationTest.ticketCreate_writesAuditRow` to assert TWO rows (CREATE + AUTO_ASSIGN) instead of one was *easy* — the rows are independent, with different actors, different actions, and (per D2's "the actor for CREATE is who POSTed; the actor for AUTO_ASSIGN is SYSTEM") different semantic ownership. A "reshape the CREATE row with an `autoAssigned: true` flag" alternative (which I considered for D2) would have made the test mutation harder — every existing CREATE-row-shape assertion across the codebase would need a conditional check.
+- **ADR 0007's `existsByIdIncludingDeleted` vs `existsById` distinction continues paying dividends.** The workload endpoint's `projects.existsById()` automatically returns false for soft-deleted projects (via `@SQLRestriction`), so the spec §3 "404 if missing or soft-deleted" is a single existence check, not a two-step "exists physically? + exists in active state?" dance. The integration test (`workloadEndpoint_softDeletedProject_returns404`) exercises this through the real `@SQLDelete` lifecycle.
+- **The slice-7 `AuditLogService` API was correctly designed back then.** `logSystem(action, entity, id, diff)` was added in slice 7 "for AdminSeeder + slice-13 auto-assigner + slice-14 scheduler" (verbatim from its JavaDoc). Slice 13 used it on day one — no signature changes, no overload churn. Forward-compat design by call site enumeration, validated.
+- **`AutoAssigner.candidateIdsFor()` reusing the workload query** (instead of a separate `select u.id from User u where <membership>`) is the right trade-off. The cost: a tiny bit of wasted compute in the `COUNT(t)` aggregation when the caller only wants ids. The benefit: ONE membership predicate to keep correct. The integration test pins both consumers to the same query, so a future ADR change re-tested through one path validates both.
+
+**Rejected alternatives:**
+- **Explicit `project_members` join table.** Documented in ADR 0007 — would have required a migration, two new admin endpoints, and changes to every ticket-create call site that needs to assert membership. Not in spec. Migration path is documented so this is a one-day swap if it's ever genuinely needed.
+- **Reshape the existing CREATE audit row with auto-assign info instead of writing a second row** (D2 alt). Would have conflated USER and SYSTEM actors on one row and broken the existing slice-7 invariant that "actor matches the principal who triggered the row." Test-update cost would have been higher across the audit codebase.
+- **Sort the workload list in Java after the SQL.** Wasted CPU; risks the SQL and Java orderings drifting in some future refactor (e.g., adding a SECONDARY sort field server-side). SQL is the single source of truth for the spec §Endpoint ordering.
+- **Defer D7 (slice-5 deferred half) to slice 15 polish.** Tempting because it's an additive change with a small blast radius. Rejected because (a) the infrastructure is exactly what slice 13 builds anyway (`candidateIdsFor`), (b) keeping the seam open another slice means another set of TODO markers to remember, and (c) the test coverage for D7 fits naturally inside `TicketServiceTest` + `AutoAssignIntegrationTest` — no new test file.
+- **Per-uploader / per-project-owner authz for the workload endpoint.** Spec doesn't ask, no clear use case. The endpoint surfaces operational data, not sensitive PII.
+
+---
+
 ## Template for future sessions (copy-paste, don't leave empty)
 ```
 ## Session NN — <slice name>
