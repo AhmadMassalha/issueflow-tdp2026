@@ -172,20 +172,35 @@ The suite is hermetic — it runs against H2 in PostgreSQL-compatibility mode
 and needs **no Docker, no Postgres, no env vars**. Expect:
 
 ```
-[INFO] Tests run: 145, Failures: 0, Errors: 0, Skipped: 0
+[INFO] Tests run: 462, Failures: 0, Errors: 0, Skipped: 0
 [INFO] BUILD SUCCESS
 ```
 
-Breakdown (so you know what's being exercised):
+Wall-clock: ~25–30 seconds on a 2024 MacBook Pro (M-series).
 
-| Layer                 | Tests | Slice |
-| --------------------- | ----: | ----- |
-| Cross-cutting (base entity, global errors)        | 13 | 1 |
-| Users (repo + service + web)                      | 29 | 2 |
-| Auth (JWT, deny list, integration)                | 30 | 3 |
-| Projects (repo + service + web)                   | 30 | 4 |
-| Tickets (repo + service + web — FSM, optimistic locking, soft-delete column) | 43 | 5 |
-| **Total**                                         | **145** | |
+Breakdown by slice (so you know what's being exercised):
+
+| Slice | Feature                                                    | Tests |
+| :---: | ---------------------------------------------------------- | ----: |
+| 1     | Foundation (base entity, global errors, page envelope)     |    15 |
+| 2     | Users CRUD                                                 |    29 |
+| 3     | Auth (JWT issuance, deny list, security integration)       |    29 |
+| 4     | Projects CRUD                                              |    47 |
+| 5     | Tickets CRUD + FSM + optimistic locking                    |    63 |
+| 6     | Comments CRUD + optimistic locking                         |    40 |
+| 7     | Audit log + cross-cutting wiring                           |    41 |
+| 8     | Ticket dependencies + cycle detection                      |    41 |
+| 9     | Soft delete + restore (Project + Ticket)                   |    10 |
+| 10    | Mentions + paginated `/users/{id}/mentions`                |    38 |
+| 11    | CSV export / import                                        |    36 |
+| 12    | Attachments (DB-backed `@Lob`, MIME + magic-byte sniff)    |    41 |
+| 13    | Auto-assign by workload (`/projects/{id}/workload`)        |    19 |
+| 14    | Auto-escalation scheduler (`@Scheduled` overdue passes)    |    13 |
+| **Total**                                                          | **462** |
+
+Each row blends repository (`@DataJpaTest`), service (Mockito), controller
+(`@WebMvcTest`), and end-to-end (`@SpringBootTest`) tests. The four-layer
+mix is the project's testing convention — see `.cursor/rules/30-testing.mdc`.
 
 ---
 

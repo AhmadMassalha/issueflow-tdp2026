@@ -1515,9 +1515,48 @@ CRITICAL, then flips `isOverdue = true` (idempotent). Manual PATCH of
 
 ---
 
-## Final retrospective (fill in at submission time)
-- Total slices completed: <n>
-- Slices where I rewrote significant agent output: <list>
-- Concepts the agent got wrong on the first attempt and I had to correct: <list>
-- Things I learned during this assignment: <list>
-- If I were to do it again, I would: <list>
+## Final retrospective (slice 15)
+
+### By the numbers
+- **15 slices** shipped across 15 sessions (1 per `docs/spec/*.md` + slice 1 foundation + slice 15 polish + the "reviewer DX" chore commit between slices 5 and 6).
+- **462/462 tests** at submission — 100% pass rate, no skips. Suite runs in ~25–30s on H2 (PostgreSQL mode), needs zero infra.
+- **84 decisions formally recorded** (`Di` in the per-session entries) plus 7 ADRs.
+- **22 specific Gotchas** in `.cursor/rules/30-testing.mdc`, every one earned by a real test failure (not speculative).
+- **10 consecutive slices** with ZERO new `ErrorCode`, `AuditAction`, or `EntityType` after the slice-1 pre-seed. Every enum value the codebase ever needs was added once, in slice 1, with JavaDoc naming the future caller.
+- **3 cross-slice forward-compat hooks** that paid off later without modification: slice-5 D6 (`TicketService.update` clears `isOverdue` on priority PATCH) used by slice 14; slice-7 `AuditLogService.logSystem(...)` (JavaDoc named "AdminSeeder + slice-13 + slice-14") used by slices 13 + 14; slice-3 `SchedulingConfig` (`@EnableScheduling` + `Clock` `@Bean` with JavaDoc saying "Slice 14 will add the ticket-escalation scheduler without needing to re-enable scheduling here") used by slice 14.
+
+### Slices where I rewrote significant agent output
+- **Slice 11 (CSV)** — caught the JWT async-dispatch bug (`OncePerRequestFilter.shouldNotFilterAsyncDispatch()` defaults to `true`, killing `SecurityContext` on `StreamingResponseBody` re-dispatches). Promoted the fix + the testing rule.
+- **Slice 12 (Attachments)** — fixed H2's rejection of Hibernate-generated `BLOB` DDL for `@Lob byte[]` in PostgreSQL mode by adding `@Column(columnDefinition = "BYTEA")`. Promoted to `30-testing.mdc`.
+- **Slice 12 (GlobalExceptionHandler)** — added a missing `@ExceptionHandler(MissingServletRequestPartException.class)` arm so the catch-all `Exception` handler doesn't turn missing multipart parts into 500s. Pre-existing gap shared by slice 11's CSV controller.
+- **Slice 13 (test fixtures)** — `/auth/login` audit-row pollution. Tests asserting audit-row counts must `auditLogs.deleteAll()` AFTER login. Promoted to `30-testing.mdc`.
+- **Slice 14 (self-inflicted)** — created a duplicate `ClockConfig` and overwrote `SchedulingConfig` without grepping first; both already existed since slice 3. Caught by `git status` BEFORE the commit. Promoted to `30-testing.mdc`: "Before adding `@Configuration` / `@Bean` for cross-cutting infra, grep for existing beans of that type FIRST."
+
+### Concepts the agent got wrong on the first attempt
+- **`@Transactional(REQUIRES_NEW)` propagation in CSV import** — first cut had it on the same class as the orchestrator method, which silently degrades to REQUIRED because Spring's AOP proxy doesn't intercept self-calls. Fixed by extracting `CsvImportRowExecutor` as a separate bean (the canonical Spring idiom).
+- **`@SQLDelete` SQL parameter binding** — initially wrote `UPDATE tickets SET deleted_at = NOW() WHERE id = ?` for the Ticket entity. H2 threw error 90008 "Invalid value 2 for parameter parameterIndex" because the entity has `@Version` and Hibernate binds (id, version) in that order, expecting TWO placeholders in the custom SQL. Fixed to `WHERE id = ? AND version = ?`. Promoted to `30-testing.mdc`.
+- **`@Lob byte[]` with `Clob`/`Blob` semantics in test profile** — `application-test.yaml` uses H2 in PostgreSQL mode, but Hibernate's `H2Dialect` generates `BLOB` DDL by default, which H2-in-PG-mode rejects. Fixed with `@Column(columnDefinition = "BYTEA")`.
+- **Strict-stubbing in Mockito** — several slice-12 tests' service-level stubs of `currentUserProvider.currentUser()` triggered `UnnecessaryStubbingException` on validation-failure branches that bailed out before the stub was needed. Fixed with `Mockito.lenient()` per stub, not per test.
+
+### Things I learned during this assignment
+1. **Spec-driven development genuinely changes how the code lands.** Every slice opened with a "decisions surface" listing the open questions, got explicit user approval for each, THEN built. The result is a codebase where every non-obvious choice is recorded with its alternative and rejection rationale. New contributors can read `docs/decisions/` + per-session `prompts.md` and reconstruct WHY any given line of code looks the way it does.
+2. **Forward-compat hooks pay off dramatically when designed at the right level of abstraction.** Slice 5 D6 was a 3-line conditional that slice 14 simply inherited; slice 7's `logSystem` overload was a deliberate method-level seam that slices 13 + 14 both consumed unchanged; slice 1's pre-seeded enums made the cross-cutting `AuditAction` and `Actor` story coherent across 14 slices without a single enum addition. The discipline of writing the JavaDoc for each hook ("Future slice X will call this") doubled as a TODO list for ourselves.
+3. **`.cursor/rules/30-testing.mdc` should be treated as a living document, not a one-time setup.** Every Gotcha in there was caught by a real test failure (or an interesting code-review observation). By the end we had 22 entries — each one prevents one specific class of bug from ever happening again on this codebase. The pattern is "fail → fix → promote → move on."
+4. **One source of truth for cross-cutting queries beats DRY-by-method.** Slice 13 reused `UserRepository.findWorkloadForProject` for BOTH the auto-assigner AND the `/workload` endpoint; if I'd written two queries, ADR 0007's membership predicate would have drifted within months. The `candidateIdsFor()` projection over the same query was the lazy-but-right move.
+5. **Per-slice commits with detailed messages are the project's actual documentation.** `git log --oneline` reads like a table of contents; `git show <hash>` for any slice shows the full context (decisions, bugs caught, files touched, test deltas). When `prompts.md` and the commit message agree, you can review the codebase by reading 14 commits.
+6. **Integration tests are the cross-slice contract enforcement layer.** Mockito tests prove a single slice's branching; `@SpringBootTest` tests prove that slice A + slice B + slice C compose correctly. The slice-14 `EscalationIntegrationTest.manualPatchPriority_resetsTheCycle` is the entire reason I trust the slice-5 → slice-14 handshake survived 9 intervening slices.
+7. **`prompts.md` was the highest-leverage document in this project.** Reading it back top-to-bottom is the cleanest reconstruction of the development arc. The Session-N-decision-table format scales: you can scan it in 30 seconds per slice and know exactly what was debated and resolved.
+
+### If I were to do it again, I would
+1. **Pre-grep the codebase before any new `@Configuration` or `@Bean`.** Slice 14's `ClockConfig` duplication would never have happened with a 1-line `Grep "@EnableScheduling"` first. Cost ~10 minutes to catch + fix; would have cost 0 minutes if I'd checked first.
+2. **Add a `slice-completion-checklist.md` template** alongside `AGENTS.md` and `docs/plan.md` that lists per-slice ritual: surface decisions → user approval → ADR (if needed) → implement → tests → run suite → update `prompts.md` → commit. By slice 6 I'd internalized the rhythm; the first 5 slices would have shipped 30% faster with a checklist.
+3. **Snapshot the test-count delta in every commit message body.** Every slice-N commit since slice 12 has a "Suite: X/X green (+Y vs slice N-1)" line — that single line proves the slice didn't break anything AND added net new coverage. Should have been there from slice 6.
+4. **Treat the `Gotcha` list in `30-testing.mdc` as a first-class artifact from slice 1.** I started promoting Gotchas only around slice 7; the earlier slices have lessons buried in `prompts.md` that aren't easily greppable. Migrating them retroactively would be a nice 30-minute task before submission.
+5. **Add a `compose.yml` / `docker-compose` smoke test target.** `./mvnw test` is hermetic but doesn't exercise the real PostgreSQL bindings. A `make smoke` target that boots `compose.yml`, runs the app, runs `run.md` §5 curl commands, and tears down would catch any PostgreSQL-specific drift the H2 mode masks (we caught one such drift with the BYTEA fix; others could be lurking).
+6. **Pin `springdoc-openapi` more visibly.** The slice "reviewer DX" commit pinned it to 2.7.0 (because 2.8.x crashes Spring Framework 6.2's PathPattern parser). That decision is recorded in `prompts.md` and `run.md` §8, but the `pom.xml` comment is the kind of thing a future Dependabot PR would silently bump. A `<!-- DO NOT BUMP — see Session 05.5 -->` comment on the version literal would have been wiser.
+
+### Final state at submission
+- **Tree:** 14 functional slices + 1 chore (reviewer DX) + 1 polish (slice 15) = 16 commits in `main`.
+- **Tests:** 462/462. Slice-15 final `./mvnw clean test` verifies from a clean state.
+- **Docs:** `README.md` (API contract), `run.md` (reviewer onboarding + slice-by-slice test breakdown), `docs/plan.md` (build plan), `docs/spec/*.md` (13 per-feature acceptance docs), `docs/decisions/*.md` (7 ADRs), `prompts.md` (15 session entries + this retrospective), `AGENTS.md` (AI working agreement), `.cursor/rules/*.mdc` (5 rule files including 22 testing Gotchas).
+- **Outstanding tech debt:** zero spec violations; one accepted runtime trade-off (single-instance scheduler — see slice 14 rejected alternatives); two intentional dev-time WARN logs (JWT dev fallback, default `admin/admin` seeder) both documented in `run.md` §3.
