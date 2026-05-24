@@ -21,6 +21,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
+import org.springframework.web.multipart.support.MissingServletRequestPartException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /**
@@ -217,6 +218,21 @@ public class GlobalExceptionHandler {
         ApiError body = ApiError.of(HttpStatus.PAYLOAD_TOO_LARGE, ErrorCode.PAYLOAD_TOO_LARGE,
                 "Uploaded payload exceeds the maximum allowed size.", req.getRequestURI());
         return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).body(body);
+    }
+
+    /**
+     * Symmetric counterpart to {@link #handleMissingParam}: the equivalent
+     * for multipart {@code file} parts that the client forgot to attach.
+     * Spring throws this when {@code @RequestParam("file") MultipartFile}
+     * is declared but the request had no part with that name. Mapped to
+     * 400 {@code MISSING_PARAMETER} for shape-consistency with the
+     * non-multipart "missing required param" case.
+     */
+    @ExceptionHandler(MissingServletRequestPartException.class)
+    public ResponseEntity<ApiError> handleMissingPart(MissingServletRequestPartException ex, HttpServletRequest req) {
+        ApiError body = ApiError.of(HttpStatus.BAD_REQUEST, ErrorCode.MISSING_PARAMETER,
+                "Missing required multipart part: " + ex.getRequestPartName(), req.getRequestURI());
+        return ResponseEntity.badRequest().body(body);
     }
 
     // ---- Last-resort ------------------------------------------------------------

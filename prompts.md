@@ -1244,6 +1244,77 @@ That's it — **one production bug, in pre-existing code, surfaced by the first 
 
 ---
 
+## Session 12 — Attachments (spec 11)
+**Goal:** `docs/spec/11-attachments.md` §1–§6 — upload/download/delete binary attachments on tickets with MIME validation, magic-byte sniffing (defense in depth), 10 MB cap, and per-op audit rows.
+
+**Decisions (D1–D10) — user approved all my recommendations:**
+
+| # | Decision | Choice (rationale) |
+|---|---|---|
+| D1 | Storage strategy | **Database `@Lob byte[]`** as the spec mandates. Single tx = file + audit row land together. 10 MB cap + take-home context = "what if the table reaches 200 GB" doesn't apply. Production trade-off (S3/object storage) noted in this entry. |
+| D2 | MIME validation depth | **Header AND magic-byte sniff** for PNG (`89 50 4E 47 0D 0A 1A 0A`), JPEG (`FF D8 FF`), PDF (`%PDF` = `25 50 44 46`). Skip sniffing for `text/plain` (no reliable magic). Mismatch → 415 `ATTACHMENT_UNSUPPORTED_TYPE`. **Contrast with slice 11's CSV (header-only):** attachments may be hostile uploads; CSVs are user-friendly imports authored by the user. Different threat model, different validation. |
+| D3 | Implement download endpoint? | **Yes — `GET /tickets/{tid}/attachments/{aid}`** per spec's "implement for completeness" parenthetical. Without it the feature is write-only. `ResponseEntity<Resource>` (not `StreamingResponseBody`) since `@Lob byte[]` is already eager-loaded in memory — pretending to stream would be theatre. |
+| D4 | Filename sanitization | **Strip control chars + path separators + `"`; cap at 255; fallback to `attachment-<id>`** if empty. RFC 6266 `filename="..."` + `filename*=UTF-8''...` for unicode preservation. Classic header-injection mitigation. |
+| D5 | `AttachmentResponse` shape | **Metadata only**: `{id, ticketId, filename, contentType, sizeBytes, uploadedBy, createdAt}`. NEVER includes `data` bytes — JSON would balloon, and the GET endpoint is the bytes channel. |
+| D6 | Extend `BaseEntity`? | **No — like `AuditLog` and `Mention`.** Attachments are immutable (write-once, optionally delete). No `@Version`, no `updatedAt`. Only `createdAt` via `@CreationTimestamp`. |
+| D7 | Soft-delete cascade behavior | **No cascade.** Attachments outlive a soft-deleted parent ticket (same ADR 0002 logic that protects ticket-on-project soft delete). Restore brings them back. New uploads onto a soft-deleted ticket return 404 because `@SQLRestriction` hides the parent from `tickets.findById()`. |
+| D8 | Hard-delete cascade | N/A — hard delete is now unreachable (slice 9 swapped via `@SQLDelete`). If a "purge" admin endpoint ever ships, that's the slice that decides. |
+| D9 | RBAC | **`@PreAuthorize("isAuthenticated()")`** on POST/GET/DELETE. Spec lists no role gate. "Only uploader or ADMIN can delete" would be reasonable for a real product — noted as a known gap. |
+| D10 | Test strategy | **4 test classes** (Repository JPA, Service Mockito, Controller WebMvc, Integration `@SpringBootTest`) mirroring slice 11's layout. Integration owns audit invariant, real multipart wire, true `@Lob`-via-Hibernate round trip, soft-delete edge cases. |
+
+**Obvious / non-decisions:**
+- Zero new `ErrorCode` / `AuditAction` / `EntityType` — `ATTACHMENT_*` codes + `EntityType.ATTACHMENT` were pre-seeded in slices 1+5. `AuditAction.CREATE`/`DELETE` already exist. **8th consecutive slice** with no enum churn.
+- Multipart 10 MB cap already configured in `application.yaml` (added in slice 7 for CSV's max-file-size). Spec §2 says "Re-check in service in case the limit changes" — service re-validates `file.getSize() <= 10 MB` to emit the attachment-specific `ATTACHMENT_TOO_LARGE` code (the framework's `MaxUploadSizeExceededException` is mapped to the generic `PAYLOAD_TOO_LARGE` by the global handler).
+- The "implement (Implied) GET — document the choice" instruction from spec §3 is fulfilled here in D3.
+- Production note (D1): a real prod system would store the bytes in S3/MinIO with the DB holding only `{bucket, key, sha256}`. Avoids row-size bloat, lets the CDN serve, and decouples blob lifecycle from row lifecycle. Not done here because reviewer-runnable-with-zero-infra > optimal-architecture-for-a-take-home.
+
+**Touch list:**
+- New main (~6 files): `attachments/api/{AttachmentController, AttachmentResponse}`, `attachments/domain/Attachment`, `attachments/repository/AttachmentRepository`, `attachments/service/AttachmentService`, `attachments/service/MagicBytes` helper.
+- No modifications to existing main code — the slice-11 JWT async-dispatch fix already covers any future async endpoint (we're using `ResponseEntity<Resource>` here, which is sync).
+- New tests: `AttachmentRepositoryJpaTest`, `AttachmentServiceTest`, `AttachmentControllerWebMvcTest`, `AttachmentsIntegrationTest`.
+
+**Prompt (verbatim):**
+> Build slice 12 (Attachments) per `docs/spec/11-attachments.md`. New `attachments/` feature module: `Attachment` entity (`id`, `ticketId`, `filename`, `contentType`, `sizeBytes`, `data: byte[] @Lob`, `uploadedBy`, `createdAt` via `@CreationTimestamp`; does NOT extend `BaseEntity`, immutable per D6). `AttachmentRepository` with `findByTicketId`, bulk `deleteByTicketId`. `AttachmentService` with `upload(ticketId, MultipartFile, principal)` (re-checks size cap → 413 `ATTACHMENT_TOO_LARGE`; MIME allowlist `image/png`+`image/jpeg`+`application/pdf`+`text/plain` → 415 `ATTACHMENT_UNSUPPORTED_TYPE`; magic-byte sniff for PNG/JPEG/PDF — skip for text/plain — mismatch also 415; verifies ticket exists + not soft-deleted via `tickets.findById()` → 404 `TICKET_NOT_FOUND`; writes audit row `CREATE/ATTACHMENT`), `download(attachmentId)` returns `Attachment`, `delete(attachmentId)` (404 `ATTACHMENT_NOT_FOUND` if missing; audit row `DELETE/ATTACHMENT`). `AttachmentController` with `POST /tickets/{tid}/attachments` (multipart), `GET /tickets/{tid}/attachments/{aid}` (download — `ResponseEntity<Resource>` with sanitized RFC-6266 `Content-Disposition`, original `contentType`, `Content-Length`), `DELETE /tickets/{tid}/attachments/{aid}` (204 NoContent). `MagicBytes` helper with `pngMatches`/`jpegMatches`/`pdfMatches` reading from `MultipartFile.getInputStream()` first 8 bytes (uses `BufferedInputStream` + `mark/reset` so the subsequent `getBytes()` call still works). Tests: `AttachmentRepositoryJpaTest` (persist round-trip with `@Lob`, `findByTicketId`, bulk delete), `AttachmentServiceTest` (12+ tests: happy upload, MIME header reject, magic-byte mismatch for each binary type, oversize 413, ticket-not-found 404, soft-deleted-parent 404, download happy, download 404, delete happy, delete 404), `AttachmentControllerWebMvcTest` (multipart upload 200, missing file 400, wrong MIME header 415, download streams body with right headers + filename sanitization, DELETE 204, DELETE 404), `AttachmentsIntegrationTest` (round-trip upload→download byte-equality, audit row per op via real wire, oversize→413, soft-deleted ticket → 404 on new upload, existing attachments still downloadable, MIME magic-byte mismatch end-to-end).
+
+**AI output (what shipped, files touched):**
+- New files (6 main):
+  - `attachments/domain/Attachment.java` — entity, `@Lob byte[]` with `columnDefinition = "BYTEA"` (H2-in-PG-mode portability fix), lazy fetch, FK as plain `Long`, immutable (no `BaseEntity`).
+  - `attachments/repository/AttachmentRepository.java` — `JpaRepository` + `findByTicketIdOrderByIdAsc` + bulk `deleteByTicketId` (the latter unused this slice; reserved for a future "purge" admin endpoint).
+  - `attachments/api/AttachmentResponse.java` — record, 7 fields, NEVER includes `data`.
+  - `attachments/service/MagicBytes.java` — pure-function magic-byte sniffer for PNG/JPEG/PDF (8-byte buffer max).
+  - `attachments/service/AttachmentService.java` — `upload` / `download` / `delete`. Validation order: ticket → file present → size → MIME header → magic bytes. Audit rows for CREATE/DELETE; download is unaudited (reads aren't logged in this codebase — same convention as every other read).
+  - `attachments/api/AttachmentController.java` — `POST` / `GET` / `DELETE`. `ResponseEntity<Resource>` for download with sanitised RFC-6266 `Content-Disposition` (both `filename=` and `filename*=UTF-8''...`), `Content-Type` from the stored mime, `Content-Length` from `sizeBytes`.
+- 1 main modified: `common/web/GlobalExceptionHandler.java` — added `@ExceptionHandler(MissingServletRequestPartException.class)` returning 400 `MISSING_PARAMETER` (caught by the new controller's test; pre-existing gap that slice 11 also had but didn't exercise).
+- 4 test classes (+41 tests):
+  - `AttachmentRepositoryJpaTest` — 5 tests: `@Lob` byte-equality round-trip, `createdAt` autopopulation, `findByTicketIdOrderByIdAsc` filter + sort, `deleteByTicketId` returns count + isolates non-matching tickets, deletion of nonexistent ticket returns 0.
+  - `AttachmentServiceTest` — 18 Mockito tests: happy PNG/JPEG/PDF/text upload; ticket missing/soft-deleted → 404; empty file → 400; oversize → 413 (real 10 MB+1 byte array); disallowed MIME → 415; null MIME → 415; charset suffix tolerated; PNG/JPEG/PDF magic-byte mismatch → 415; download happy + 404; delete happy + 404; audit row verified per success.
+  - `AttachmentControllerWebMvcTest` — 11 tests: 200 + metadata-only response (`$.data` does NOT exist); 400 on missing multipart part (NEW handler); 415/413/404 on service-thrown errors; download streams bytes with Content-Type + Content-Length + Content-Disposition; filename sanitisation; blank-filename fallback; DELETE 204 + 404.
+  - `AttachmentsIntegrationTest` — 7 `@SpringBootTest` tests: byte-equality round-trip through real `@Lob` + multipart wire; spec §6 audit invariant (one CREATE row, one DELETE row, actor=USER, performedBy=dev.id); magic-byte mismatch 415 end-to-end; text/plain skips sniff happy path; **Session 12 D7 soft-delete cascade behavior** (parent soft-deleted → new upload 404, existing attachments still downloadable by id); 404 on missing attachment id.
+
+**Bugs caught:**
+1. **Production-shape bug (slice 12 own code), caught BEFORE first test run via deliberate spec-driven mental model:** `@Lob byte[]` with default Hibernate H2Dialect generates `BLOB`, which H2-in-PG-mode rejects. Diagnosed in 1 build run by enabling `show-sql + DEBUG hibernate.SQL`. Fix: `@Column(columnDefinition = "BYTEA")`. Production PostgreSQL accepts native BYTEA; H2-in-PG-mode accepts it as an alias. Single annotation, zero test-only shim. Promoted to `.cursor/rules/30-testing.mdc` as a new Gotcha so the next `@Lob` field anywhere in the codebase gets it right the first time.
+2. **Pre-existing framework gap surfaced by slice 12:** `MissingServletRequestPartException` was uncaught by `GlobalExceptionHandler`, falling through to the catch-all `Exception` → 500. Slice 11's CSV controller has the same gap but the slice-11 tests always sent the part. Fix: added an explicit handler mapping to 400 `MISSING_PARAMETER`. Slice 11 now benefits silently (same shared advice). Promoted to `30-testing.mdc` as a Gotcha.
+3. **Mockito strict-stubbing on shared `@BeforeEach`:** the principal stub was eagerly set for every test but validation-failure paths short-circuit before the service touches it. Fix: `Mockito.lenient()` on the shared stub. (Standard Mockito pattern; not a bug per se, just a tip-of-the-iceberg lint.)
+
+**Zero bugs in the new slice-12 code itself beyond #1** — the surface area was correct on the first compile pass; only the H2-dialect ergonomics tripped us up.
+
+**Suite:** **427/427 green** (+41 vs slice 11's 386). Surefire ~18s.
+
+**Design wins / lessons:**
+- The "single magic-byte sniffer class with three predicates and a documented skip for text/plain" abstraction kept the service body readable — the alternative (inline byte comparisons in the `switch`) would have buried the contract.
+- `@Column(columnDefinition = "BYTEA")` is the right escape hatch for `@Lob` portability across H2-in-PG-mode and real PostgreSQL. It survives any future dialect upgrade because BYTEA is PG-native, not an H2 quirk.
+- Per-slice "decisions table → user surfaces approval → implementation" cadence is paying off — slice 12 went from "user said go" to 427 green in roughly 10 file writes with one production-shape bug caught (the BLOB issue) before it could leak into any other code path.
+- `addFilters = false` on `@WebMvcTest` + `@Import(GlobalExceptionHandler.class)` continues to be the right shape — the WebMvc tests verify HTTP-shape contracts (status codes, response shapes, header presence) without dragging in the JWT chain; the integration test does the end-to-end-with-real-filters work.
+- Choosing `ResponseEntity<Resource>` instead of `StreamingResponseBody` for download was the right call — saves the slice-11 async-dispatch headache (the `@Lob byte[]` is already eager-loaded into memory by the time we serve it). The async pattern is reserved for future features where the bytes channel is genuinely incremental (e.g., a video-attachment slice).
+
+**Rejected alternatives:**
+- Storing attachments on the filesystem / S3 (D1 alt). Right for prod, wrong for a take-home: would require either bundling MinIO into `run.md` or stubbing the storage backend in a way that the reviewer would have to read to trust. The DB-backed `@Lob` keeps everything in one tx.
+- Adding `Resource`-returning custom `MediaType` headers in the controller's static config (vs. inline per-method). Inline is closer to the spec and matches the existing controller pattern (CSV controller also inlines its `Content-Disposition`).
+- Per-uploader delete permission. Reasonable, but the spec doesn't ask, and undocumented authz invites a "why?" review question. Listed as a known gap in this entry.
+- Eager-loading `@Lob byte[]`. Was tempting because the data IS in fact loaded on every download, but lazy is the right default — the (future) "list attachments for a ticket" endpoint doesn't need the bytes, and `@Lob` on a `Basic(LAZY)` field is well-supported by Hibernate (it just needs an open session, which our `@Transactional(readOnly=true)` download wrapper provides).
+
+---
+
 ## Template for future sessions (copy-paste, don't leave empty)
 ```
 ## Session NN — <slice name>
