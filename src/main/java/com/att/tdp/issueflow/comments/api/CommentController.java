@@ -1,9 +1,14 @@
 package com.att.tdp.issueflow.comments.api;
 
 import com.att.tdp.issueflow.auth.security.IssueFlowUserPrincipal;
+import com.att.tdp.issueflow.comments.domain.Comment;
 import com.att.tdp.issueflow.comments.service.CommentService;
+import com.att.tdp.issueflow.comments.service.CommentService.CommentWithMentions;
+import com.att.tdp.issueflow.mentions.api.MentionedUserSummary;
+import com.att.tdp.issueflow.mentions.service.MentionService;
 import jakarta.validation.Valid;
 import java.util.List;
+import java.util.Map;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.access.prepost.PreAuthorize;
@@ -50,10 +55,24 @@ import org.springframework.web.bind.annotation.RestController;
 public class CommentController {
 
     private final CommentService service;
+    private final MentionService mentions;
 
+    /**
+     * Spec 05 §2 list, now decorated with the slice-10 {@code mentionedUsers}
+     * shape (Session 10 D7). Batched mention fetch keyed by comment id —
+     * one round-trip for the whole page, regardless of size.
+     */
     @GetMapping
     public List<CommentResponse> list(@PathVariable Long ticketId) {
-        return service.listByTicket(ticketId).stream().map(CommentResponse::from).toList();
+        List<Comment> rows = service.listByTicket(ticketId);
+        if (rows.isEmpty()) {
+            return List.of();
+        }
+        List<Long> ids = rows.stream().map(Comment::getId).toList();
+        Map<Long, List<MentionedUserSummary>> mentionsByComment = mentions.findForComments(ids);
+        return rows.stream()
+                .map(c -> CommentResponse.from(c, mentionsByComment.getOrDefault(c.getId(), List.of())))
+                .toList();
     }
 
     @PostMapping
@@ -61,7 +80,8 @@ public class CommentController {
     public CommentResponse create(@PathVariable Long ticketId,
                                   @Valid @RequestBody CreateCommentRequest req,
                                   @AuthenticationPrincipal IssueFlowUserPrincipal principal) {
-        return CommentResponse.from(service.create(ticketId, req, principal));
+        CommentWithMentions result = service.create(ticketId, req, principal);
+        return CommentResponse.from(result.comment(), result.mentionedUsers());
     }
 
     @PatchMapping("/{commentId}")
@@ -69,7 +89,8 @@ public class CommentController {
                                   @PathVariable Long commentId,
                                   @Valid @RequestBody PatchCommentRequest req,
                                   @AuthenticationPrincipal IssueFlowUserPrincipal principal) {
-        return CommentResponse.from(service.update(ticketId, commentId, req, principal));
+        CommentWithMentions result = service.update(ticketId, commentId, req, principal);
+        return CommentResponse.from(result.comment(), result.mentionedUsers());
     }
 
     @DeleteMapping("/{commentId}")

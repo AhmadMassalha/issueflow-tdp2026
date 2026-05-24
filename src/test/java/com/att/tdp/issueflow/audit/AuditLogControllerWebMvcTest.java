@@ -93,7 +93,7 @@ class AuditLogControllerWebMvcTest {
     // ---- happy path ---------------------------------------------------------
 
     @Test
-    @DisplayName("Spec 06 §4 — ADMIN: 200 with PageResponse envelope (items/page/size/totals)")
+    @DisplayName("Spec 06 §4 — ADMIN: 200 with the standard PageResponse envelope (data/total/page/pageSize)")
     @WithMockUser(roles = "ADMIN")
     void should_return200_andEnvelope_forAdmin() throws Exception {
         Page<AuditLog> page = new PageImpl<>(
@@ -102,19 +102,20 @@ class AuditLogControllerWebMvcTest {
                 1L);
         when(service.find(any(), any(), any(), any(), any(Pageable.class))).thenReturn(page);
 
+        // Session 10 D6: envelope is now {data, total, page, pageSize} with
+        // 1-indexed wire page (Spring's 0 → wire's 1).
         mvc.perform(get("/audit-logs"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.items").isArray())
-                .andExpect(jsonPath("$.items[0].id").value(7))
-                .andExpect(jsonPath("$.items[0].action").value("CREATE"))
-                .andExpect(jsonPath("$.items[0].entityType").value("TICKET"))
-                .andExpect(jsonPath("$.items[0].entityId").value(1))
-                .andExpect(jsonPath("$.items[0].actor").value("USER"))
-                .andExpect(jsonPath("$.items[0].performedBy").value(10))
-                .andExpect(jsonPath("$.page").value(0))
-                .andExpect(jsonPath("$.size").value(20))
-                .andExpect(jsonPath("$.totalItems").value(1))
-                .andExpect(jsonPath("$.totalPages").value(1));
+                .andExpect(jsonPath("$.data").isArray())
+                .andExpect(jsonPath("$.data[0].id").value(7))
+                .andExpect(jsonPath("$.data[0].action").value("CREATE"))
+                .andExpect(jsonPath("$.data[0].entityType").value("TICKET"))
+                .andExpect(jsonPath("$.data[0].entityId").value(1))
+                .andExpect(jsonPath("$.data[0].actor").value("USER"))
+                .andExpect(jsonPath("$.data[0].performedBy").value(10))
+                .andExpect(jsonPath("$.page").value(1))
+                .andExpect(jsonPath("$.pageSize").value(20))
+                .andExpect(jsonPath("$.total").value(1));
     }
 
     // ---- RBAC: covered end-to-end in AuditIntegrationTest --------------------
@@ -154,7 +155,7 @@ class AuditLogControllerWebMvcTest {
     // ---- pagination --------------------------------------------------------
 
     @Test
-    @DisplayName("Pagination — defaults: page=0, size=20 when client omits both")
+    @DisplayName("Pagination — defaults: page=1 on wire (Spring 0), pageSize=20 when client omits both")
     @WithMockUser(roles = "ADMIN")
     void should_useDefaultPagination_whenOmitted() throws Exception {
         Page<AuditLog> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
@@ -164,6 +165,7 @@ class AuditLogControllerWebMvcTest {
 
         ArgumentCaptor<Pageable> captor = ArgumentCaptor.forClass(Pageable.class);
         verify(service).find(eq(null), eq(null), eq(null), eq(null), captor.capture());
+        // Spring side: page=1 - 1 = 0.
         assertThat(captor.getValue().getPageNumber()).isZero();
         assertThat(captor.getValue().getPageSize()).isEqualTo(20);
         assertThat(captor.getValue().getSort().getOrderFor("timestamp"))
@@ -172,13 +174,13 @@ class AuditLogControllerWebMvcTest {
     }
 
     @Test
-    @DisplayName("Pagination — size clamped to MAX_PAGE_SIZE=100 when client asks for more")
+    @DisplayName("Pagination — pageSize clamped to MAX_PAGE_SIZE=100 when client asks for more")
     @WithMockUser(roles = "ADMIN")
     void should_clampSize_whenOversize() throws Exception {
         Page<AuditLog> empty = new PageImpl<>(List.of(), PageRequest.of(0, 100), 0L);
         when(service.find(any(), any(), any(), any(), any(Pageable.class))).thenReturn(empty);
 
-        mvc.perform(get("/audit-logs").param("size", "10000"))
+        mvc.perform(get("/audit-logs").param("pageSize", "10000"))
                 .andExpect(status().isOk());
 
         ArgumentCaptor<Pageable> captor = ArgumentCaptor.forClass(Pageable.class);
@@ -187,18 +189,34 @@ class AuditLogControllerWebMvcTest {
     }
 
     @Test
-    @DisplayName("Pagination — negative page clamped to 0")
+    @DisplayName("Pagination — page < 1 on the wire clamps to Spring page 0 (forgiving, not 400)")
     @WithMockUser(roles = "ADMIN")
-    void should_clampNegativePage_toZero() throws Exception {
+    void should_clampSubOnePage_toFirstPage() throws Exception {
         Page<AuditLog> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
         when(service.find(any(), any(), any(), any(), any(Pageable.class))).thenReturn(empty);
 
+        // wire page=-5 → max(1, -5) - 1 = 0
         mvc.perform(get("/audit-logs").param("page", "-5"))
                 .andExpect(status().isOk());
 
         ArgumentCaptor<Pageable> captor = ArgumentCaptor.forClass(Pageable.class);
         verify(service).find(any(), any(), any(), any(), captor.capture());
         assertThat(captor.getValue().getPageNumber()).isZero();
+    }
+
+    @Test
+    @DisplayName("Pagination — wire page=2 maps to Spring page=1 (1-indexed → 0-indexed)")
+    @WithMockUser(roles = "ADMIN")
+    void should_convert1IndexedPage_to0Indexed() throws Exception {
+        Page<AuditLog> empty = new PageImpl<>(List.of(), PageRequest.of(1, 20), 0L);
+        when(service.find(any(), any(), any(), any(), any(Pageable.class))).thenReturn(empty);
+
+        mvc.perform(get("/audit-logs").param("page", "2"))
+                .andExpect(status().isOk());
+
+        ArgumentCaptor<Pageable> captor = ArgumentCaptor.forClass(Pageable.class);
+        verify(service).find(any(), any(), any(), any(), captor.capture());
+        assertThat(captor.getValue().getPageNumber()).isEqualTo(1);
     }
 
     // ---- filter pass-through ------------------------------------------------

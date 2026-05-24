@@ -415,13 +415,15 @@ class AuditIntegrationTest {
         // login itself writes a row — this proves the envelope shape end-to-end.
         String token = login("admin-it", "admin-pw");
 
+        // Session 10 D6: standard envelope is now {data, total, page, pageSize}
+        // with 1-indexed wire page.
         mvc.perform(get("/audit-logs").header("Authorization", "Bearer " + token))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.items").isArray())
-                .andExpect(jsonPath("$.page").value(0))
-                .andExpect(jsonPath("$.size").value(20))
+                .andExpect(jsonPath("$.data").isArray())
+                .andExpect(jsonPath("$.page").value(1))
+                .andExpect(jsonPath("$.pageSize").value(20))
                 // The admin-it LOGIN row is in here at least.
-                .andExpect(jsonPath("$.items[?(@.action == 'LOGIN')]").exists());
+                .andExpect(jsonPath("$.data[?(@.action == 'LOGIN')]").exists());
     }
 
     // ---- helpers ------------------------------------------------------------

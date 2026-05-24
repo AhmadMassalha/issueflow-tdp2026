@@ -1074,6 +1074,95 @@ Three new Gotchas added — H2 cross-class persistence, `@WebMvcTest` × `@Enabl
 
 ---
 
+## Session 10 — @Mentions + standardizing the pagination envelope (spec 09 + slice-7 correction)
+**Goal:** `docs/spec/09-mentions.md` §1–§6 — regex extractor, `Mention` join entity, `GET /users/{id}/mentions` paginated. AND — because reading spec 09 surfaced two contract drifts that need fixing now (not later) — also: (a) refactor slice 7's `PageResponse<T>` to match the `api-contract.mdc` envelope rule, and (b) change `CommentResponse.mentionedUsers` from `List<Long>` to `List<MentionedUserSummary>` as the slice-6 JavaDoc warned would happen.
+
+**Decisions surfaced before coding (D1–D13) — user approved all my recommendations, INCLUDING the two flagged contract corrections:**
+
+| # | Decision | Choice (rationale) |
+|---|---|---|
+| D1 | Mention extraction location | **New `MentionService.syncForComment(comment)` called from `CommentService.create/update` in the same `@Transactional`.** Two-line caller; extractor + diff is its own testable unit. Spec §1/§2 require "same transaction" — Spring's default `REQUIRED` propagation flows through. |
+| D2 | Regex + dedup + DB lookup | **Regex `@([A-Za-z0-9_]{3,32})` (spec verbatim) + dedup by lowercased username before lookup. `LOWER(username) IN (...)` resolves to existing users; unknown usernames silently ignored.** Single batched DB hit per comment. |
+| D3 | Update-comment mention diff: surgical vs wipe-and-reinsert | **Surgical: (oldSet, newSet) → INSERT delta + DELETE delta.** Preserves `mention.created_at` on the rows that survive, which the "newest first" sort on `/users/{id}/mentions` (spec §3) depends on. Wipe-and-reinsert would invalidate every existing sort order. |
+| D4 | Mention entity FK references | **Plain `Long commentId` + `Long mentionedUserId`** — consistent with the rest of the codebase (no `@ManyToOne`). JOIN queries use JPQL. |
+| D5 | Mention cleanup on comment hard-delete | **Explicit `mentions.deleteByCommentId(commentId)` BEFORE `comments.deleteById(commentId)` in `CommentService.delete`.** No DB-level CASCADE; explicit + audit-friendly. Comments are hard-deleted (spec 05), so no soft-delete cascade question. |
+| **D6** ⚠️ | **Pagination envelope drift** — `api-contract.mdc` mandates `{ data, total, page, pageSize }` (page=1 default, max pageSize=100). Slice 7 shipped `PageResponse<T>` as `{ items, page, size, totalItems, totalPages }` (page=0, Spring's native shape). Slice 7 silently diverged from the contract rule. | **Standardize on the contract spec. Refactor `PageResponse<T>` to `{ data, total, page, pageSize }` with 1-indexed `page`.** Update `/audit-logs` controller + `AuditLogControllerWebMvcTest` + `AuditIntegrationTest` + `PageResponseTest`. One envelope across the API. Captured as an explicit slice-10 correction of a slice-7 oversight (and a lesson logged about reading the always-on rules MORE carefully when shipping new envelope shapes). |
+| **D7** ⚠️ | **`CommentResponse.mentionedUsers` shape** — slice 6 shipped `List<Long>` (always empty) with a JavaDoc explicitly warning slice 10 might change it. Spec 09 §1 says it should be `[{ id, username, fullName }]`. | **Change to `List<MentionedUserSummary>` where `MentionedUserSummary = (Long id, String username, String fullName)`.** The slice-6 JavaDoc literally told us this was coming (Session-06 D7). Update all comment-related tests that touch the field. |
+| D8 | Page-param defaults + conversion | **`page` defaults to 1 (wire format), `pageSize` to 20, max 100.** Service maps to Spring's 0-indexed `PageRequest.of(page - 1, pageSize)`. `page < 1` or `pageSize < 1` → 400 `VALIDATION_FAILED`. Off-by-one between wire and Spring contained in one mapping line. |
+| D9 | `/users/{id}/mentions` for non-existent user | **404 `USER_NOT_FOUND`** via `users.existsById(id)` first. Standard tenancy idiom. |
+| D10 | Audit log on mention CRUD | **No.** Mentions are derived data; the COMMENT.UPDATE audit row already records the change. Tripling audit volume for no incremental info isn't worth it. Spec doesn't require it. |
+| D11 | Newest-first sort: `mention.created_at` vs `comment.created_at`? | **`mention.created_at`** (spec §3 verbatim). When an old comment is edited to add `@me`, my mention list shows it at the top with today's date. Matches user expectation. |
+| D12 | "Mention yourself" allowed (spec §6) | **Yes, no special case.** The extractor sees `@me` like any other handle. Unique constraint `(comment_id, mentioned_user_id)` caps self-mentions at one per comment. Implementing nothing IS the implementation. |
+| D13 | Test strategy | **4 new test classes (Repo, Service, WebMvc, Integration) + extend `CommentServiceTest`.** Slice-7 envelope refactor + slice-6 mentionedUsers shape change force test updates in 3-4 existing tests; that's the price of fixing the drift in one slice instead of letting it metastasize. |
+
+**Obvious / standard items (not separate decisions):**
+- `Mention` entity does NOT extend `BaseEntity` — it only needs `id` and `created_at` (no `updated_at`, no `version`, no `deleted_at`). Same pattern as `AuditLog`.
+- Zero new `ErrorCode` (`USER_NOT_FOUND` pre-seeded). Zero new `AuditAction`. **6th** consecutive slice with no enum churn.
+- The `/users/{id}/mentions` endpoint is per-user — not RBAC-restricted further. Authenticated user calling for someone else's id is allowed (you can see "who has been mentioning person X" in a public project). If a privacy concern surfaces later, add a `@PreAuthorize` then.
+- `MentionService.syncForComment` is called from `CommentService.update` only when the content actually changed (no content change = same `@`-tokens = same mentions = no-op work).
+- Audit row visibility: comment updates already write an audit row (slice 7); mention rows landing in the same transaction don't need their own.
+
+**Touch list:**
+- New main source: `mentions/{domain/Mention.java, repository/MentionRepository.java, api/{MentionedUserSummary.java, MentionController.java}, service/MentionService.java}` (5 files).
+- Modified main source: `common/web/PageResponse.java`, `audit/api/AuditLogController.java`, `comments/api/CommentResponse.java`, `comments/service/CommentService.java`, possibly `comments/repository/CommentRepository.java` (helper for batch-fetch by IDs).
+- New tests: `MentionRepositoryJpaTest`, `MentionServiceTest`, `MentionControllerWebMvcTest`, `MentionsIntegrationTest`.
+- Modified tests: `CommentServiceTest`, `CommentControllerWebMvcTest`, `AuditLogControllerWebMvcTest`, `AuditIntegrationTest`, `PageResponseTest`.
+
+**Prompt (verbatim):**
+> Build slice 10 (mentions) per `docs/spec/09-mentions.md` AND fix the two contract drifts surfaced by reading the spec (D6, D7). New `mentions/` feature module: `Mention` entity (id + commentId + mentionedUserId + createdAt + unique constraint), repository (`deleteByCommentId`, paginated `findCommentIdsByMentionedUserIdOrderByCreatedAtDesc`), `MentionService` (regex extract + dedup-by-lower + INSERT/DELETE diff + `findMentionsForUser` paginated), `GET /users/{userId}/mentions?page=&pageSize=` controller. Refactor `PageResponse<T>` from `{items,page,size,totalItems,totalPages}` to `{data,total,page,pageSize}` with 1-indexed `page` per `.cursor/rules/20-api-contract.mdc`; update slice-7's `AuditLogController` + its tests accordingly. Change `CommentResponse.mentionedUsers` from `List<Long>` to `List<MentionedUserSummary>`. Wire `MentionService.syncForComment(...)` into `CommentService.create` and `CommentService.update` in the same transaction; clean up on `delete`. Tests: `MentionRepositoryJpaTest` (persistence + unique constraint + paged sort by created_at desc), `MentionServiceTest` (regex, dedup, case-insens, unknown ignored, diff sync, self-mention allowed), `MentionControllerWebMvcTest` (envelope shape + page params + 404 for missing user), `MentionsIntegrationTest` (end-to-end create-comment-with-@user → row → shows on the listing). Extend `CommentServiceTest`, `CommentControllerWebMvcTest`, plus the three slice-7 envelope tests.
+
+**AI output (verbatim shape, not pasted in full — see git diff for `d01d7a2..HEAD`):**
+
+Brand-new module `mentions/` (5 files):
+- `domain/Mention.java` — JPA entity. Plain `Long commentId`/`mentionedUserId` (no `@ManyToOne`), unique constraint `uk_mention_comment_user(comment_id, mentioned_user_id)`, index `idx_mention_user_created(mentioned_user_id, created_at)`. Does NOT extend `BaseEntity` — only needs `id` + `created_at`, like `AuditLog`.
+- `repository/MentionRepository.java` — 6 query methods: `findMentionedUserIdsByCommentId`, `findMentionedUsersByCommentId` (JPQL constructor projection for `MentionedUserSummary`), `findCommentMentionsByCommentIds` (batched flat-row projection for listing), `deleteByCommentId`, `deleteByCommentIdAndMentionedUserIds` (bulk DELETE for diff's REMOVE half), `findCommentIdsForMentionedUser` (paged, sorted by `createdAt DESC, id DESC`).
+- `api/MentionedUserSummary.java` — projection record `(id, username, fullName)` per spec §1.
+- `service/MentionService.java` — extractor (`MENTION_PATTERN = @([A-Za-z0-9_]{3,32})`), `syncForComment(comment)` (resolve → diff currentIds vs desiredIds → INSERT + DELETE deltas), `deleteForComment(commentId)`, `findForComment(commentId)`, batched `findForComments(commentIds): Map<Long, List<MentionedUserSummary>>`, paged `findMentionsForUser(userId, pageable)` (404 USER_NOT_FOUND guard + race-safe comment-deleted-between-queries skip).
+- `api/MentionController.java` — `GET /users/{userId}/mentions?page=&pageSize=` (`@PreAuthorize("isAuthenticated()")`, 1-indexed wire `page` → 0-indexed Spring conversion, defaults page=1, pageSize=20, max 100).
+
+Modified main source (5 files):
+- `common/web/PageResponse.java` — **renamed fields** from `(items, page, size, totalItems, totalPages)` → `(data, total, page, pageSize)`. 1-indexed wire `page` (Spring's 0 → wire's 1) in the `of(...)` factory. D6 correction of slice-7 drift.
+- `audit/api/AuditLogController.java` — param renamed `size → pageSize`, default page changed from `0 → 1`, 1→0 conversion in `pageable(...)`. JavaDoc explicitly cites D6 + lineage.
+- `comments/api/CommentResponse.java` — `mentionedUsers: List<Long>` → `List<MentionedUserSummary>` (D7). Added `from(comment, mentions)` 2-arg factory + `fromWithoutMentions(comment)` alias for call sites that don't have a mention list to hand.
+- `comments/service/CommentService.java` — injected `MentionService`; `create()` and `update()` now return `CommentWithMentions(comment, mentionedUsers)` (a new public record exposed for the controller boundary). `update()` only re-syncs when content actually changed (skip-on-no-op, preserves `mention.created_at` per D3). `delete()` invokes `mentions.deleteForComment(commentId)` BEFORE `comments.delete(...)` (Mockito `inOrder` test pins the ordering).
+- `comments/api/CommentController.java` — injected `MentionService`; list endpoint now batch-loads mentions via `mentions.findForComments(commentIds)` (one query for the whole page); create/update unwrap the new `CommentWithMentions` tuple.
+- `users/repository/UserRepository.java` — added `findMentionedUsersByLoweredUsernames(Collection<String>)` (case-insensitive batch lookup that resolves the dedup'd lower-cased handle set to `MentionedUserSummary` projections in one query).
+
+**Manual fixes applied during the pass:**
+
+1. **Repository query: mixed-projection-with-alias didn't work.** My first stab at `findCommentMentionsByCommentIds` mixed a JPQL `new ConstructorExpression(...)` with another aliased field (`as user`) in the same SELECT, intending to use a Spring Data `interface` projection (`getCommentId() / getUser()`). Hibernate doesn't reliably parse that combination. **Fix:** switched to a flat `record CommentMentionRow(Long commentId, Long userId, String username, String fullName)` with a `toUser()` helper. Single straightforward constructor expression, no interface-projection ambiguity. Caught at compile-time on first run — no test failure, just refused to wire.
+2. **Bulk-delete repository method was missing.** First-pass `syncForComment` did a `findAll().stream().filter(...).findFirst()` loop for the DELETE delta — quadratic, scans the whole `mentions` table per removed user. **Fix:** added `MentionRepository.deleteByCommentIdAndMentionedUserIds(commentId, Collection<userIds>)` as a `@Modifying @Query` — one bulk DELETE per call. Caught during code review of my own initial output (before any tests ran).
+
+**Bugs caught by the test pass (in TEST code only this slice — production was clean):**
+
+1. **Self-mention test used `@me` — 2 chars, fails spec's `{3,32}`.** `MentionServiceTest.sync_selfMentionAllowed` expected the regex to extract "me" from `note to self @me`. The regex's minimum is 3 chars, so nothing matched and `mentions.saveAll` was never called. **Fix:** changed the handle to `@self` (4 chars). The bug is a great test for what the regex DOES at its boundary — keeping the test as-is but with a valid handle. This is consistent with the spec's literal text — no production change needed.
+2. **`PageImpl(content, pageable, total)` auto-correction.** Spring's `PageImpl` silently rewrites `total` when `pageable.offset + pageable.pageSize > total` AND content is non-empty (treats it as the last-page case and clamps total to `offset + content.size`). My `MentionServiceTest.list_raceSafe_skipsMissingComments` fixture used pageSize=10 but total=2 → triggered the correction, resulting in test failure "expected 2, but was 1". **Fix:** sized the test's `pageSize` to match the content size (`PageRequest.of(0, 2)` for 2 ids) so the auto-correction branch doesn't fire. Promoted to `.cursor/rules/30-testing.mdc` as a Gotcha — this is the second time we've been bitten by a "Spring is being helpful" silent override.
+3. **Integration test seed username `mt-author` contained a hyphen.** Hyphens aren't in the spec's `[A-Za-z0-9_]` regex class. `@mt-author` produced no match (`mt` is 2 chars), so `selfMention_allowed` saw zero rows in `mentions`. **Fix:** renamed seed to `mt_author` (underscore is in the class). Promoted to `30-testing.mdc` so future integration tests don't repeat the mistake. This bug almost slipped through — would have manifested as a vague "GET /mentions returned 0 items" later if the integration test hadn't exercised it specifically.
+4. **H2 cross-class contamination on common usernames.** `MentionRepositoryJpaTest` (a `@DataJpaTest`) tries to seed `alice`/`bob` users; if `MentionsIntegrationTest` ran first in the same Surefire JVM, those usernames are already committed and `@DataJpaTest`'s rollback doesn't clean them. Eight failures, all `UK_USERS_USERNAME` violations. This is a SIBLING of the slice-7 wipe Gotcha — but wiping won't help because there's no transaction to roll back the seed into. **Fix:** namespaced the JPA test's seed usernames with a per-test counter prefix (`mrjt-{n}-{label}`) — guaranteed unique no matter what ran before. Promoted to `.cursor/rules/30-testing.mdc`. Tests that assert on the username value were rewritten to assert on `id` / `fullName` (the label is still encoded in the latter).
+
+**Rejected paths considered:**
+- *Split `mentionedUsersDetail` field instead of changing `mentionedUsers` type (D7 alternative).* The slice-6 JavaDoc actually suggested this as an "escape hatch". Rejected because spec 09 §1 literally says the field is `mentionedUsers: [{ id, username, fullName }]` — adding a parallel field would mean shipping two different mention representations on one response (the legacy empty `[Long]` plus the new `[Summary]`). Cleaner to just change the type. The slice-6 author was thinking about backwards compatibility for an external client, but we're slicing pre-release; one breaking change in one slice is far better than two parallel fields forever.
+- *Standalone `MentionPageResponse<T>` instead of standardizing `PageResponse<T>` (D6 alternative).* Would have left `/audit-logs` and `/users/{id}/mentions` shipping different envelope shapes for the same conceptual operation. The reviewer's first question would be "why?" — and "I forgot to read the always-on rule before slice 7" is not an answer I want to give. Spent ~20 lines of test changes on the refactor; saves a 200-word explanation later.
+- *Audit MENTION.* `CREATE`/`DELETE`/`UPDATE`* — was on the original AI plan. Rejected at decision-time (D10). The COMMENT.UPDATE row already records the source change; deriving mentions from `comment.content` snapshots is straightforward if a forensic query needs them. Audit volume would 2-3x for zero incremental info. Zero new `AuditAction` (6th consecutive slice).
+- *Wipe-and-reinsert mention rows on every comment UPDATE.* Simpler than the diff. Rejected (D3) because spec §3's "newest first by mention.created_at" sort depends on stable timestamps for surviving rows. Wipe-and-reinsert would mean editing a 2-year-old comment to fix a typo moves all its mentions to the top of every mentioned user's inbox. Diff preserves `created_at` for unchanged mentions.
+- *MentionService.syncForComment returns void.* Forces caller to make a second query for the response shape. Rejected for the obvious round-trip cost — returning the resolved `List<MentionedUserSummary>` from sync is free (we just resolved them).
+- *`@ManyToOne` associations on `Mention` instead of plain `Long` FKs.* Consistent with the rest of the codebase (slice-04/05 convention). Rejected for the same reasons every other entity rejected it: cheaper response projection, no fetch-mode questions, predictable JPQL JOINs.
+
+**Run results:** `./mvnw test` → **350/350 green** (+42 vs slice 9's 308). Breakdown of additions:
+- `MentionRepositoryJpaTest` — 8 tests (persistence + UK + projection + batched + sort).
+- `MentionServiceTest` — 15 tests (extractor branches, diff arithmetic, listing edge cases).
+- `MentionControllerWebMvcTest` — 7 tests (envelope shape, 1↔0 conversion, 404, defaults, clamping).
+- `MentionsIntegrationTest` — 8 tests (create→list, update preserves+adds, update removes, delete cascades, paging, audit, self-mention, unknown handle ignored).
+- `CommentServiceTest` — +4 tests (mention-sync invoked on create with returned list, unchanged content skips sync, delete order with inOrder, etc.).
+
+Zero new `ErrorCode` / `AuditAction` / `EntityType` enum additions (6th consecutive slice with no enum churn — see `prompts.md` Session 9 for the streak's start).
+
+**Documentation updates:**
+- `.cursor/rules/30-testing.mdc` — added three new Gotchas: PageImpl auto-correction, username regex hyphen exclusion, cross-class unique-constraint contamination.
+- `prompts.md` — this session (Session 10) added with D1–D13 + the contract-correction explanation for D6 and D7.
+
+---
+
 ## Template for future sessions (copy-paste, don't leave empty)
 ```
 ## Session NN — <slice name>

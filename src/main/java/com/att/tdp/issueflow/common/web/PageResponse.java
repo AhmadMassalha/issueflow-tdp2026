@@ -4,49 +4,52 @@ import java.util.List;
 import org.springframework.data.domain.Page;
 
 /**
- * Standard JSON envelope for paginated endpoints (Session 07 D4).
+ * Standard JSON envelope for every paginated endpoint, per
+ * {@code .cursor/rules/20-api-contract.mdc}.
  *
- * <p>Defined here instead of returning Spring's {@code Page<T>} directly
- * because the default {@code PageImpl} JSON serialization carries 10+
- * fields ({@code pageable}, {@code sort}, {@code last}, {@code first},
- * {@code numberOfElements}, …) that clients shouldn't be coupled to. This
- * envelope exposes the five that matter:
+ * <p><b>Slice 10 correction (D6):</b> the original slice-7 version of this
+ * record used Spring's native field names {@code (items, page, size,
+ * totalItems, totalPages)} with a 0-indexed {@code page}. The always-on
+ * api-contract rule mandated {@code (data, total, page, pageSize)} with
+ * 1-indexed {@code page} from day one — slice 7 silently diverged.
+ * Slice 10 corrects that drift in one place so both paginated endpoints
+ * ({@code /audit-logs}, {@code /users/{id}/mentions}) ship the same
+ * envelope.
  *
  * <pre>
  * {
- *   "items":      [ … ],   // the page contents
- *   "page":       0,       // 0-indexed page number
- *   "size":       20,      // page size (capped server-side)
- *   "totalItems": 137,     // total matching rows
- *   "totalPages": 7        // ceil(totalItems / size)
+ *   "data":     [ … ],   // page contents (mapped DTOs)
+ *   "total":    137,     // total matching rows across all pages
+ *   "page":     1,       // 1-indexed page number on the wire
+ *   "pageSize": 20       // page size (capped server-side at 100)
  * }
  * </pre>
  *
- * <p>Used by spec 06 (audit log) and earmarked for slice 10 (mentions
- * inbox). Any future paginated endpoint should reuse this envelope rather
- * than inventing a new shape.
+ * <p>The off-by-one between the wire's 1-indexed {@code page} and Spring's
+ * 0-indexed {@code Pageable} is contained in {@link #of(Page,
+ * java.util.function.Function)} — controllers convert at the boundary
+ * ({@code PageRequest.of(page - 1, pageSize)}) and this factory reads back
+ * Spring's 0-indexed {@code getNumber()} and adds 1 before returning.
  */
 public record PageResponse<T>(
-        List<T> items,
+        List<T> data,
+        long total,
         int page,
-        int size,
-        long totalItems,
-        int totalPages
+        int pageSize
 ) {
 
     /**
-     * Convert a Spring Data {@link Page} to the envelope. Generic over both
-     * the source row type {@code S} and the response item type {@code T}
-     * so the caller can map entity → DTO in one place (typically a static
-     * {@code Response::from} method reference).
+     * Convert a Spring Data {@link Page} to the wire envelope. Generic over
+     * both source row type {@code S} and response item type {@code T} so the
+     * caller can map entity → DTO via a method reference. Adds 1 to Spring's
+     * 0-indexed page number to produce the 1-indexed wire value (D8).
      */
     public static <S, T> PageResponse<T> of(Page<S> source, java.util.function.Function<S, T> mapper) {
         return new PageResponse<>(
                 source.getContent().stream().map(mapper).toList(),
-                source.getNumber(),
-                source.getSize(),
                 source.getTotalElements(),
-                source.getTotalPages()
+                source.getNumber() + 1, // 0-indexed Spring → 1-indexed wire
+                source.getSize()
         );
     }
 }

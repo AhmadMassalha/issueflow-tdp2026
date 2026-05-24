@@ -14,7 +14,10 @@ import com.att.tdp.issueflow.comments.api.PatchCommentRequest;
 import com.att.tdp.issueflow.comments.domain.Comment;
 import com.att.tdp.issueflow.comments.repository.CommentRepository;
 import com.att.tdp.issueflow.comments.service.CommentService;
+import com.att.tdp.issueflow.comments.service.CommentService.CommentWithMentions;
 import com.att.tdp.issueflow.common.enums.Role;
+import com.att.tdp.issueflow.mentions.api.MentionedUserSummary;
+import com.att.tdp.issueflow.mentions.service.MentionService;
 import com.att.tdp.issueflow.common.exception.ConflictException;
 import com.att.tdp.issueflow.common.exception.ForbiddenException;
 import com.att.tdp.issueflow.common.exception.NotFoundException;
@@ -56,6 +59,14 @@ class CommentServiceTest {
     /** Slice 7 wiring — see AuditIntegrationTest for cross-cutting proof. */
     @Mock
     private AuditLogService auditLog;
+
+    /**
+     * Slice 10 wiring — the mention sync is invoked from create/update/delete.
+     * Unit tests assert the call happens (and with the right arguments);
+     * end-to-end behavior is proven in {@code MentionsIntegrationTest}.
+     */
+    @Mock
+    private MentionService mentions;
 
     @InjectMocks
     private CommentService service;
@@ -114,7 +125,9 @@ class CommentServiceTest {
             return c;
         });
 
-        Comment result = service.create(
+        when(mentions.syncForComment(any(Comment.class))).thenReturn(List.of());
+
+        CommentWithMentions result = service.create(
                 TICKET_ID,
                 new CreateCommentRequest("hello"),
                 principal(AUTHOR_ID, Role.DEVELOPER));
@@ -124,7 +137,31 @@ class CommentServiceTest {
         assertThat(captor.getValue().getAuthorId()).isEqualTo(AUTHOR_ID);
         assertThat(captor.getValue().getTicketId()).isEqualTo(TICKET_ID);
         assertThat(captor.getValue().getContent()).isEqualTo("hello");
-        assertThat(result.getId()).isEqualTo(COMMENT_ID);
+        assertThat(result.comment().getId()).isEqualTo(COMMENT_ID);
+        assertThat(result.mentionedUsers()).isEmpty();
+        // Session 10 D1: sync runs in the same transaction as the save.
+        verify(mentions).syncForComment(captor.getValue());
+    }
+
+    @Test
+    @DisplayName("Session 10 D1 + D7: create returns the resolved mentions from MentionService for the response envelope")
+    void create_returnsMentionsFromSync() {
+        when(tickets.existsById(TICKET_ID)).thenReturn(true);
+        when(comments.save(any(Comment.class))).thenAnswer(i -> {
+            Comment c = i.getArgument(0);
+            c.setId(COMMENT_ID);
+            c.setVersion(0L);
+            return c;
+        });
+        var alice = new MentionedUserSummary(42L, "alice", "Alice Liddell");
+        when(mentions.syncForComment(any(Comment.class))).thenReturn(List.of(alice));
+
+        CommentWithMentions result = service.create(
+                TICKET_ID,
+                new CreateCommentRequest("hi @alice"),
+                principal(AUTHOR_ID, Role.DEVELOPER));
+
+        assertThat(result.mentionedUsers()).containsExactly(alice);
     }
 
     @Test
@@ -224,13 +261,17 @@ class CommentServiceTest {
     void update_adminCanEditOthers() {
         Comment loaded = existing(COMMENT_ID, TICKET_ID, AUTHOR_ID, 0L);
         when(comments.findByIdAndTicketId(COMMENT_ID, TICKET_ID)).thenReturn(Optional.of(loaded));
+        when(mentions.syncForComment(loaded)).thenReturn(List.of());
 
-        Comment result = service.update(
+        CommentWithMentions result = service.update(
                 TICKET_ID, COMMENT_ID,
                 new PatchCommentRequest("moderated", 0L),
                 principal(OTHER_USER_ID, Role.ADMIN));
 
-        assertThat(result.getContent()).isEqualTo("moderated");
+        assertThat(result.comment().getContent()).isEqualTo("moderated");
+        // Session 10: content changed → sync runs (not findForComment).
+        verify(mentions).syncForComment(loaded);
+        verify(mentions, never()).findForComment(any());
     }
 
     @Test
@@ -238,13 +279,14 @@ class CommentServiceTest {
     void update_authorEditsOwn() {
         Comment loaded = existing(COMMENT_ID, TICKET_ID, AUTHOR_ID, 0L);
         when(comments.findByIdAndTicketId(COMMENT_ID, TICKET_ID)).thenReturn(Optional.of(loaded));
+        when(mentions.syncForComment(loaded)).thenReturn(List.of());
 
-        Comment result = service.update(
+        CommentWithMentions result = service.update(
                 TICKET_ID, COMMENT_ID,
                 new PatchCommentRequest("edited", 0L),
                 principal(AUTHOR_ID, Role.DEVELOPER));
 
-        assertThat(result.getContent()).isEqualTo("edited");
+        assertThat(result.comment().getContent()).isEqualTo("edited");
         // No explicit save() — dirty-checking persists at commit. Verify
         // that no UPDATE happens through an explicit save call so we don't
         // accidentally double-save (which would mask version issues).
@@ -252,30 +294,56 @@ class CommentServiceTest {
     }
 
     @Test
+    @DisplayName("Session 10: PATCH with content unchanged → mention sync is SKIPPED (no churn); fetches current mentions for the response")
+    void update_unchangedContent_skipsSync_butFetchesMentions() {
+        Comment loaded = existing(COMMENT_ID, TICKET_ID, AUTHOR_ID, 3L);
+        // content is "original" — request passes the same value back.
+        when(comments.findByIdAndTicketId(COMMENT_ID, TICKET_ID)).thenReturn(Optional.of(loaded));
+        var bob = new MentionedUserSummary(99L, "bob", "Bob Roberts");
+        when(mentions.findForComment(COMMENT_ID)).thenReturn(List.of(bob));
+
+        CommentWithMentions result = service.update(
+                TICKET_ID, COMMENT_ID,
+                new PatchCommentRequest("original", 3L),
+                principal(AUTHOR_ID, Role.DEVELOPER));
+
+        assertThat(result.mentionedUsers()).containsExactly(bob);
+        verify(mentions, never()).syncForComment(any());
+        verify(mentions).findForComment(COMMENT_ID);
+    }
+
+    @Test
     @DisplayName("PATCH with null content but valid version → version-controlled no-op (intentional, see PatchCommentRequest JavaDoc)")
     void update_nullContentIsNoop_butRunsVersionCheck() {
         Comment loaded = existing(COMMENT_ID, TICKET_ID, AUTHOR_ID, 3L);
         when(comments.findByIdAndTicketId(COMMENT_ID, TICKET_ID)).thenReturn(Optional.of(loaded));
+        when(mentions.findForComment(COMMENT_ID)).thenReturn(List.of());
 
-        Comment result = service.update(
+        CommentWithMentions result = service.update(
                 TICKET_ID, COMMENT_ID,
                 new PatchCommentRequest(null, 3L),
                 principal(AUTHOR_ID, Role.DEVELOPER));
 
-        assertThat(result.getContent()).isEqualTo("original");
+        assertThat(result.comment().getContent()).isEqualTo("original");
+        // Content stayed null → unchanged → sync skipped (D-1+D-3 combined).
+        verify(mentions, never()).syncForComment(any());
     }
 
     // ---- Spec 05 §5 — delete --------------------------------------------------
 
     @Test
-    @DisplayName("Spec 05 §5: DELETE by author → succeeds (hard delete)")
+    @DisplayName("Spec 05 §5 + Session 10 D5: DELETE by author → mention cleanup runs BEFORE the comment delete")
     void delete_authorOk() {
         Comment loaded = existing(COMMENT_ID, TICKET_ID, AUTHOR_ID, 0L);
         when(comments.findByIdAndTicketId(COMMENT_ID, TICKET_ID)).thenReturn(Optional.of(loaded));
 
         service.delete(TICKET_ID, COMMENT_ID, principal(AUTHOR_ID, Role.DEVELOPER));
 
-        verify(comments).delete(loaded);
+        // Order matters: deleting the comment first would leave orphan Mention
+        // rows in the same transaction (whose FK references no longer resolve).
+        var inOrder = org.mockito.Mockito.inOrder(mentions, comments);
+        inOrder.verify(mentions).deleteForComment(COMMENT_ID);
+        inOrder.verify(comments).delete(loaded);
     }
 
     @Test

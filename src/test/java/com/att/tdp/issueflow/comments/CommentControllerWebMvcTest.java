@@ -20,7 +20,10 @@ import com.att.tdp.issueflow.comments.api.CreateCommentRequest;
 import com.att.tdp.issueflow.comments.api.PatchCommentRequest;
 import com.att.tdp.issueflow.comments.domain.Comment;
 import com.att.tdp.issueflow.comments.service.CommentService;
+import com.att.tdp.issueflow.comments.service.CommentService.CommentWithMentions;
 import com.att.tdp.issueflow.common.enums.Role;
+import com.att.tdp.issueflow.mentions.api.MentionedUserSummary;
+import com.att.tdp.issueflow.mentions.service.MentionService;
 import com.att.tdp.issueflow.common.exception.ConflictException;
 import com.att.tdp.issueflow.common.exception.ForbiddenException;
 import com.att.tdp.issueflow.common.exception.NotFoundException;
@@ -78,6 +81,15 @@ class CommentControllerWebMvcTest {
     @MockitoBean
     private CommentService service;
 
+    /**
+     * Slice 10 wiring: the controller batches mention lookups for the list
+     * endpoint and uses the service's {@code CommentWithMentions} tuple for
+     * create/update. Mock with {@code List.of()} when the test doesn't care
+     * about mention content; set richer maps when it does.
+     */
+    @MockitoBean
+    private MentionService mentions;
+
     private static final Long TICKET_ID = 1L;
     private static final Long COMMENT_ID = 100L;
     private static final Long AUTHOR_ID = 10L;
@@ -122,7 +134,9 @@ class CommentControllerWebMvcTest {
     @DisplayName("Spec 05 §1 + Session 06 D5: POST returns 200 with the saved comment and mentionedUsers:[]")
     void create_returns200_withMentionedUsersEmpty() throws Exception {
         when(service.create(eq(TICKET_ID), any(CreateCommentRequest.class), any(IssueFlowUserPrincipal.class)))
-                .thenReturn(fixture(COMMENT_ID, TICKET_ID, AUTHOR_ID, "hi", 0L));
+                .thenReturn(new CommentWithMentions(
+                        fixture(COMMENT_ID, TICKET_ID, AUTHOR_ID, "hi", 0L),
+                        List.of()));
 
         mvc.perform(post("/tickets/{ticketId}/comments", TICKET_ID)
                         .with(as(principal(AUTHOR_ID, Role.DEVELOPER)))
@@ -135,6 +149,30 @@ class CommentControllerWebMvcTest {
                 .andExpect(jsonPath("$.content").value("hi"))
                 .andExpect(jsonPath("$.version").value(0))
                 .andExpect(jsonPath("$.mentionedUsers", hasSize(0)));
+    }
+
+    @Test
+    @DisplayName("Session 10 D7: POST returns mentionedUsers as [{id, username, fullName}] when the comment has @-mentions")
+    void create_returnsRichMentionedUsers_whenPresent() throws Exception {
+        var alice = new MentionedUserSummary(42L, "alice", "Alice Liddell");
+        var bob = new MentionedUserSummary(43L, "bob", "Bob Roberts");
+        when(service.create(eq(TICKET_ID), any(CreateCommentRequest.class), any(IssueFlowUserPrincipal.class)))
+                .thenReturn(new CommentWithMentions(
+                        fixture(COMMENT_ID, TICKET_ID, AUTHOR_ID, "hi @alice @bob", 0L),
+                        List.of(alice, bob)));
+
+        mvc.perform(post("/tickets/{ticketId}/comments", TICKET_ID)
+                        .with(as(principal(AUTHOR_ID, Role.DEVELOPER)))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(new CreateCommentRequest("hi @alice @bob"))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.mentionedUsers", hasSize(2)))
+                .andExpect(jsonPath("$.mentionedUsers[0].id").value(42))
+                .andExpect(jsonPath("$.mentionedUsers[0].username").value("alice"))
+                .andExpect(jsonPath("$.mentionedUsers[0].fullName").value("Alice Liddell"))
+                .andExpect(jsonPath("$.mentionedUsers[1].id").value(43))
+                .andExpect(jsonPath("$.mentionedUsers[1].username").value("bob"))
+                .andExpect(jsonPath("$.mentionedUsers[1].fullName").value("Bob Roberts"));
     }
 
     @Test
@@ -179,12 +217,16 @@ class CommentControllerWebMvcTest {
     // ---- Spec 05 §2 — list ----------------------------------------------------
 
     @Test
-    @DisplayName("Spec 05 §2: GET returns array, newest first (delegation contract)")
+    @DisplayName("Spec 05 §2 + Session 10: GET returns array newest first; each item carries its mentionedUsers via the batched MentionService lookup")
     void list_returnsArray() throws Exception {
         Comment c1 = fixture(101L, TICKET_ID, AUTHOR_ID, "first", 0L);
         Comment c2 = fixture(102L, TICKET_ID, AUTHOR_ID, "second", 0L);
-        // Service contract: newest first. The controller doesn't re-order.
         when(service.listByTicket(TICKET_ID)).thenReturn(List.of(c2, c1));
+
+        // Batched mentions lookup: only c2 has a mention; c1 has none.
+        var alice = new MentionedUserSummary(42L, "alice", "Alice Liddell");
+        when(mentions.findForComments(List.of(102L, 101L)))
+                .thenReturn(java.util.Map.of(102L, List.of(alice)));
 
         mvc.perform(get("/tickets/{ticketId}/comments", TICKET_ID)
                         .with(as(principal(AUTHOR_ID, Role.DEVELOPER))))
@@ -192,7 +234,9 @@ class CommentControllerWebMvcTest {
                 .andExpect(jsonPath("$", hasSize(2)))
                 .andExpect(jsonPath("$[0].id").value(102))
                 .andExpect(jsonPath("$[1].id").value(101))
-                .andExpect(jsonPath("$[0].mentionedUsers", hasSize(0)));
+                .andExpect(jsonPath("$[0].mentionedUsers", hasSize(1)))
+                .andExpect(jsonPath("$[0].mentionedUsers[0].username").value("alice"))
+                .andExpect(jsonPath("$[1].mentionedUsers", hasSize(0)));
     }
 
     @Test
@@ -247,7 +291,9 @@ class CommentControllerWebMvcTest {
     @DisplayName("Spec 05 §3: PATCH happy path → 200 with the new content and bumped version")
     void update_happyPath() throws Exception {
         when(service.update(eq(TICKET_ID), eq(COMMENT_ID), any(), any()))
-                .thenReturn(fixture(COMMENT_ID, TICKET_ID, AUTHOR_ID, "edited", 1L));
+                .thenReturn(new CommentWithMentions(
+                        fixture(COMMENT_ID, TICKET_ID, AUTHOR_ID, "edited", 1L),
+                        List.of()));
 
         mvc.perform(patch("/tickets/{ticketId}/comments/{commentId}", TICKET_ID, COMMENT_ID)
                         .with(as(principal(AUTHOR_ID, Role.DEVELOPER)))

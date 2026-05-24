@@ -15,6 +15,8 @@ import com.att.tdp.issueflow.common.exception.NotFoundException;
 import com.att.tdp.issueflow.common.exception.ValidationException;
 import com.att.tdp.issueflow.common.web.ApiError;
 import com.att.tdp.issueflow.common.web.ErrorCode;
+import com.att.tdp.issueflow.mentions.api.MentionedUserSummary;
+import com.att.tdp.issueflow.mentions.service.MentionService;
 import com.att.tdp.issueflow.tickets.repository.TicketRepository;
 import java.util.List;
 import lombok.RequiredArgsConstructor;
@@ -59,6 +61,7 @@ public class CommentService {
     private final CommentRepository comments;
     private final TicketRepository tickets;
     private final AuditLogService auditLog;
+    private final MentionService mentions;
 
     // ---- queries ------------------------------------------------------------
 
@@ -87,18 +90,26 @@ public class CommentService {
      * <p>{@code authorId} is taken from {@code currentUser.id()} (D1).
      * Any author field on the inbound DTO would be ignored — and is in fact
      * not declared on {@link CreateCommentRequest}.
+     *
+     * <p><b>Slice 10:</b> after the insert, {@link MentionService#syncForComment(Comment)}
+     * runs in the same transaction (Session 10 D1) and returns the
+     * resolved {@link MentionedUserSummary} list, which the controller
+     * plugs into the response envelope. Empty content / no recognized
+     * handles → empty list → no extra DB writes.
      */
-    public Comment create(Long ticketId, CreateCommentRequest req, IssueFlowUserPrincipal currentUser) {
+    public CommentWithMentions create(Long ticketId, CreateCommentRequest req,
+                                       IssueFlowUserPrincipal currentUser) {
         assertTicketExists(ticketId);
 
         Comment c = new Comment();
         c.setTicketId(ticketId);
         c.setAuthorId(currentUser.id());
         c.setContent(req.content());
-        // TODO(slice-10): MentionExtractor.extract(req.content()) → persist Mention rows in the same transaction.
         Comment saved = comments.save(c); // @Version starts at 0 on insert
+        // Saved.getId() is non-null after save() (IDENTITY); we need it before syncing.
+        List<MentionedUserSummary> mentioned = mentions.syncForComment(saved);
         auditLog.log(AuditAction.CREATE, EntityType.COMMENT, saved.getId());
-        return saved;
+        return new CommentWithMentions(saved, mentioned);
     }
 
     // ---- update -------------------------------------------------------------
@@ -120,8 +131,8 @@ public class CommentService {
      *       dirty-checking persists on commit; {@code @Version} increments.</li>
      * </ol>
      */
-    public Comment update(Long ticketId, Long commentId, PatchCommentRequest req,
-                          IssueFlowUserPrincipal currentUser) {
+    public CommentWithMentions update(Long ticketId, Long commentId, PatchCommentRequest req,
+                                       IssueFlowUserPrincipal currentUser) {
         if (req.version() == null) {
             throw new ValidationException(
                     ErrorCode.VERSION_REQUIRED,
@@ -141,15 +152,22 @@ public class CommentService {
                             + req.version() + ", server: v" + existing.getVersion() + ").");
         }
 
-        if (req.content() != null) {
+        boolean contentChanged = req.content() != null
+                && !req.content().equals(existing.getContent());
+        if (contentChanged) {
             existing.setContent(req.content());
-            // TODO(slice-10): re-run MentionExtractor.extract(req.content())
-            // in this same @Transactional. The DTO-level Size constraint guards
-            // the upper bound; slice 10 owns the regex.
         }
 
+        // Re-sync mentions ONLY when content changed (Session 10 — same handles
+        // for unchanged content = no-op work, plus avoids spurious DELETE/INSERT
+        // churn that would invalidate mention.created_at). If content was
+        // unchanged, hydrate the current mention list for the response.
+        List<MentionedUserSummary> mentioned = contentChanged
+                ? mentions.syncForComment(existing)
+                : mentions.findForComment(commentId);
+
         auditLog.log(AuditAction.UPDATE, EntityType.COMMENT, commentId);
-        return existing;
+        return new CommentWithMentions(existing, mentioned);
     }
 
     // ---- delete -------------------------------------------------------------
@@ -162,6 +180,10 @@ public class CommentService {
     public void delete(Long ticketId, Long commentId, IssueFlowUserPrincipal currentUser) {
         Comment existing = loadOrThrow(commentId, ticketId);
         assertAuthorOrAdmin(existing, currentUser);
+        // Mention cleanup BEFORE the comment row goes — Session 10 D5.
+        // Mentions have a non-cascading FK reference (plain Long); leaving them
+        // behind would result in orphan rows pointing at a deleted comment id.
+        mentions.deleteForComment(commentId);
         comments.delete(existing);
         auditLog.log(AuditAction.DELETE, EntityType.COMMENT, commentId);
     }
@@ -196,5 +218,16 @@ public class CommentService {
                     ErrorCode.COMMENT_FORBIDDEN,
                     "You can only edit or delete your own comments.");
         }
+    }
+
+    /**
+     * Service-layer return tuple for create + update — the Comment plus its
+     * post-sync mention list. The controller maps this to
+     * {@code CommentResponse.from(comment, mentionedUsers)} (Session 10 D7).
+     * Keeping these together at the service boundary means the controller
+     * never has to invoke {@code MentionService} explicitly to fill the
+     * response shape — the transaction has already done it.
+     */
+    public record CommentWithMentions(Comment comment, List<MentionedUserSummary> mentionedUsers) {
     }
 }

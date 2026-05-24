@@ -1,45 +1,62 @@
 package com.att.tdp.issueflow.comments.api;
 
 import com.att.tdp.issueflow.comments.domain.Comment;
+import com.att.tdp.issueflow.mentions.api.MentionedUserSummary;
 import java.time.Instant;
 import java.util.List;
 
 /**
- * Response body for every {@code /tickets/{ticketId}/comments/**} endpoint.
+ * Response body for every {@code /tickets/{ticketId}/comments/**} endpoint
+ * AND for the {@code /users/{id}/mentions} listing (spec 09 §4 — "Each
+ * item in {@code data[]} is the full comment shape including
+ * {@code mentionedUsers}").
  *
- * <p><b>{@code mentionedUsers} is included as an empty list now.</b> Spec 05
- * §1 explicitly says "including {@code mentionedUsers} (empty array until
- * slice 10)". Locking the shape in slice 6 means slice 10 (mentions) is
- * purely additive — clients written against slice 6 won't see a new field
- * appear out of nowhere and won't have to update parsers when the data
- * starts flowing.
+ * <p><b>Session 10 D7 — breaking change from slice 6.</b> Originally
+ * {@code mentionedUsers} was {@code List<Long>} (always-empty IDs). Spec 09
+ * §1 mandates {@code [{ id, username, fullName }]}, so the field's element
+ * type is now {@link MentionedUserSummary}. The slice-6 JavaDoc literally
+ * flagged this as the most likely slice-10 change (see git history of this
+ * file). Updating the type in place — rather than adding a parallel
+ * {@code mentionedUsersDetail} field — keeps the API surface tight and
+ * matches the spec wording exactly.
  *
- * <p>The field type is {@code List<Long>} (user ids). Slice 10 may
- * eventually want a richer {@code List<UserSummary>} — if so, we'll add
- * that as a separate field then ({@code mentionedUsersDetail}?) rather
- * than mutating this one's type. Keeping the slice-10 escape hatch open.
+ * <p>Two factory methods on purpose:
+ * <ul>
+ *   <li>{@link #from(Comment, List)} — call when you already have the
+ *       mentions (just synced them, or batch-loaded them for a page).
+ *       Pass {@code List.of()} for the rare endpoint that doesn't need
+ *       them.</li>
+ *   <li>{@link #fromWithoutMentions(Comment)} — alias for {@code from(c,
+ *       List.of())}. Reads better at call sites that aren't a mention
+ *       boundary (e.g. nothing-changed early-returns in
+ *       {@code CommentService.update}).</li>
+ * </ul>
  */
 public record CommentResponse(
         Long id,
         Long ticketId,
         Long authorId,
         String content,
-        List<Long> mentionedUsers,
+        List<MentionedUserSummary> mentionedUsers,
         Long version,
         Instant createdAt,
         Instant updatedAt
 ) {
 
-    public static CommentResponse from(Comment c) {
+    public static CommentResponse from(Comment c, List<MentionedUserSummary> mentionedUsers) {
         return new CommentResponse(
                 c.getId(),
                 c.getTicketId(),
                 c.getAuthorId(),
                 c.getContent(),
-                List.of(),                       // slice 10 will populate
+                mentionedUsers == null ? List.of() : mentionedUsers,
                 c.getVersion(),
                 c.getCreatedAt(),
                 c.getUpdatedAt()
         );
+    }
+
+    public static CommentResponse fromWithoutMentions(Comment c) {
+        return from(c, List.of());
     }
 }
