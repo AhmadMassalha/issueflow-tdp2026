@@ -1,6 +1,7 @@
 package com.att.tdp.issueflow.tickets.repository;
 
 import com.att.tdp.issueflow.tickets.domain.Ticket;
+import java.time.Instant;
 import java.util.List;
 import java.util.stream.Stream;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -67,4 +68,36 @@ public interface TicketRepository extends JpaRepository<Ticket, Long> {
     @QueryHints(@QueryHint(name = "org.hibernate.fetchSize", value = "256"))
     @Query("SELECT t FROM Ticket t WHERE t.projectId = :projectId ORDER BY t.id ASC")
     Stream<Ticket> streamByProjectIdOrderByIdAsc(@Param("projectId") Long projectId);
+
+    /**
+     * Slice 14 — overdue tickets considered for escalation (spec 13
+     * §Algorithm point 1).
+     *
+     * <p>Filter: {@code dueDate != null}, {@code dueDate < now},
+     * {@code status != DONE}. The {@code deleted_at IS NULL} half of the
+     * spec's WHERE clause is satisfied automatically by the
+     * {@code @SQLRestriction} on {@link Ticket} (slice 9) — JPQL respects
+     * it, so we don't repeat it here.
+     *
+     * <p>ORDER BY id ASC for (a) deterministic test assertions on
+     * audit-row ordering, (b) deterministic processing order in the
+     * scheduler so a partial batch failure is reproducible.
+     *
+     * <p>Returns a plain {@code List} (not a {@code Stream}) — the
+     * candidate set is bounded by active overdue tickets, usually a
+     * small number; batching/cursor semantics aren't worth the
+     * complexity for this slice.
+     *
+     * @param now the current instant. Injected from the {@code Clock}
+     *            bean by the caller (slice 14 D1) so tests can fix the
+     *            time without seeding tickets relative to wall-clock.
+     */
+    @Query("""
+           SELECT t FROM Ticket t
+            WHERE t.dueDate IS NOT NULL
+              AND t.dueDate < :now
+              AND t.status <> com.att.tdp.issueflow.common.enums.TicketStatus.DONE
+            ORDER BY t.id ASC
+           """)
+    List<Ticket> findOverdueForEscalation(@Param("now") Instant now);
 }

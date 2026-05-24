@@ -41,10 +41,14 @@ import org.hibernate.annotations.SQLRestriction;
  *       and emits the same {@code TICKET_VERSION_CONFLICT} code.</li>
  * </ol>
  *
- * <p><b>{@code isOverdue}:</b> declared here but not actively mutated by
- * this slice. Slice 14 (escalation) toggles it from the scheduler. Manual
- * priority changes via PATCH reset {@code isOverdue} to {@code false} per
- * spec 04 §10, implemented in {@code TicketService.update}.
+ * <p><b>{@code isOverdue}:</b> declared in slice 5. Slice 14's
+ * {@code EscalationService} sets it to {@code true} on CRITICAL tickets
+ * that remain overdue (spec 13 §Algorithm point 3) — idempotently, only
+ * when the value is actually changing. Manual priority changes via PATCH
+ * reset {@code isOverdue} to {@code false} per spec 04 §10, implemented
+ * in {@code TicketService.update} (slice 5 D6 — designed with slice 14's
+ * "reset the cycle" contract in mind, validated in slice 14's
+ * integration test).
  *
  * <p><b>Soft delete (slice 9, spec 08 + ADR 0002):</b>
  * <ul>

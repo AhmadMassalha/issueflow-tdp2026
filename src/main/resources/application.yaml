@@ -48,6 +48,15 @@ app:
       email: admin@issueflow.local
       full-name: Default Admin
 
+# ---- Slice 14: auto-escalation scheduler ------------------------------------
+# Period between escalation passes, in milliseconds. Spec 13 defaults to 5
+# minutes; the value below (300_000ms) matches that. `fixedDelay` semantics —
+# measured from end-of-pass to start-of-next, so a slow pass can't pile up.
+# Disable in tests by setting a very large value (see src/test/resources/
+# application.yaml — `999999999`).
+escalation:
+  fixed-delay-ms: 300000
+
 logging:
   level:
     com.att.tdp.issueflow: INFO

@@ -39,6 +39,16 @@ app:
       email: admin@issueflow.local
       full-name: Default Admin
 
+# ---- Slice 14: scheduler effectively-disabled for tests ---------------------
+# Session 14 D3 — push fixedDelay to ~16 minutes so the cron NEVER fires
+# during a ~30s test suite run. The @Scheduled bean still wires (so the
+# integration test exercises the @EnableScheduling parsing path), but its
+# periodic invocation is far enough out that tests can call
+# EscalationService.runEscalationPass() directly without races against the
+# scheduler thread.
+escalation:
+  fixed-delay-ms: 999999999
+
 logging:
   level:
     org.hibernate.SQL: WARN
